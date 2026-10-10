@@ -196,6 +196,7 @@ pub fn current_font() -> String {
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
 pub enum Style {
     Cartoon,
+    Pixel,
     Realistic,
 }
 
@@ -204,13 +205,15 @@ impl Style {
         match s.trim().to_lowercase().as_str() {
             "real" | "realistic" | "realista" => Some(Style::Realistic),
             "stylized" | "cartoon" | "estilizado" => Some(Style::Cartoon),
+            "pixel" | "pixelart" | "píxel" => Some(Style::Pixel),
             _ => None,
         }
     }
 
     pub fn toggled(self) -> Style {
         match self {
-            Style::Cartoon => Style::Realistic,
+            Style::Cartoon => Style::Pixel,
+            Style::Pixel => Style::Realistic,
             Style::Realistic => Style::Cartoon,
         }
     }
@@ -218,6 +221,7 @@ impl Style {
     pub fn id(self) -> &'static str {
         match self {
             Style::Cartoon => "stylized",
+            Style::Pixel => "pixel",
             Style::Realistic => "real",
         }
     }

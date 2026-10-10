@@ -24,28 +24,6 @@ pub struct View<'a> {
     pub style: Style,
 }
 
-// ---------------------------------------------------------------- rejilla de píxeles
-
-thread_local! {
-    static CELL: std::cell::Cell<f64> = const { std::cell::Cell::new(3.0) };
-}
-
-/// Tamaño del píxel del estilo estilizado (en px lógicos). Todos los peces, burbujas y adornos
-/// comparten la misma rejilla, como en el logo de Omarchy; depende solo del tamaño de la pecera.
-pub fn cell() -> f64 {
-    CELL.with(|c| c.get())
-}
-
-/// Fija la rejilla para este fotograma a partir de la escala de la pecera.
-pub fn set_cell(scale: f64) {
-    CELL.with(|c| c.set((3.0 * scale).round().clamp(2.0, 5.0)));
-}
-
-/// Redondea a la rejilla.
-pub fn snap(v: f64) -> f64 {
-    (v / cell()).round() * cell()
-}
-
 // ---------------------------------------------------------------- helpers de Cairo
 
 pub(crate) trait Quiet {
@@ -99,9 +77,10 @@ pub(crate) fn nz(v: f64) -> f64 {
 // ---------------------------------------------------------------- escena
 
 pub fn draw_tank(cr: &Context, v: &View) {
-    if v.style == Style::Realistic {
-        crate::reef::scene::draw_tank(cr, v);
-        return;
+    match v.style {
+        Style::Realistic => return crate::reef::scene::draw_tank(cr, v),
+        Style::Pixel => return crate::pixel::draw_tank(cr, v),
+        Style::Cartoon => {}
     }
     let t = v.tank;
     let (w, h) = (t.w, t.h);
@@ -110,21 +89,13 @@ pub fn draw_tank(cr: &Context, v: &View) {
     cr.clip();
 
     reset_budget();
-    set_cell(t.scale());
     let ds = cr.target().device_scale().0.max(1.0);
     water(cr, v);
-    pixelated(cr, 0.0, 0.0, w, h, |c| rays(c, v, t.t, t.boil));
+    rays(cr, v, t.t, t.boil);
     motes(cr, v);
     floor(cr, v, true);
     for (i, d) in t.decor.iter().enumerate() {
-        let (bx, by, bw, bh) = decor_box(t, d);
-        pixelated(cr, bx, by, bw, bh, |c| decor(c, v, d, false));
-        if v.hover == Some(Pick::Decor(i)) {
-            rgba(cr, v.pal.accent, 0.6);
-            cr.set_line_width(1.5);
-            cr.rectangle(bx, by, bw, bh);
-            cr.stroke_q();
-        }
+        decor(cr, v, d, v.hover == Some(Pick::Decor(i)));
     }
 
     // Los compañeros de banco del pez señalado se iluminan suavemente.
@@ -156,39 +127,23 @@ pub fn decor_box(t: &Tank, d: &Decor) -> (f64, f64, f64, f64) {
     (x - d.size * 0.7 - 6.0, base - d.size * 1.15 - 6.0, d.size * 1.4 + 12.0, d.size * 1.15 + 20.0)
 }
 
-/// Pinta `paint` a una celda por píxel y lo amplía sin suavizado: así los adornos y los rayos de luz
-/// quedan en la misma rejilla que los peces.
-pub fn pixelated(cr: &Context, x: f64, y: f64, w: f64, h: f64, paint: impl FnOnce(&Context)) {
-    let c = cell();
-    let (wp, hp) = ((w / c).ceil().max(1.0) as i32, (h / c).ceil().max(1.0) as i32);
-    let Ok(surf) = cairo::ImageSurface::create(cairo::Format::ARgb32, wp, hp) else { return };
-    {
-        let Ok(cx) = Context::new(&surf) else { return };
-        cx.set_antialias(cairo::Antialias::None);
-        cx.scale(1.0 / c, 1.0 / c);
-        cx.translate(-x, -y);
-        paint(&cx);
-    }
-    cr.save_q();
-    cr.translate(snap(x), snap(y));
-    cr.scale(c, c);
-    let _ = cr.set_source_surface(&surf, 0.0, 0.0);
-    cr.source().set_filter(cairo::Filter::Nearest);
-    let _ = cr.paint();
-    cr.restore_q();
+thread_local! {
+    static CELL: std::cell::Cell<f64> = const { std::cell::Cell::new(3.0) };
 }
 
-/// Agua del estilo estilizado: el degradado posterizado en franjas planas (de arriba abajo).
-pub fn water_bands(v: &View) -> Vec<(f64, f64, Rgb)> {
-    let t = v.tank;
-    let (top, bot) = water_colors(v);
-    let n = 9;
-    (0..n)
-        .map(|i| {
-            let (y0, y1) = (t.h * i as f64 / n as f64, t.h * (i + 1) as f64 / n as f64);
-            (y0, y1, mix(top, bot, (i as f64 + 0.5) / n as f64))
-        })
-        .collect()
+/// Tamaño del píxel de la escena del estilo Pixel (burbujas, adornos, rayos): depende del tamaño
+/// de la pecera, y lo comparten los dos renderizadores.
+pub fn cell() -> f64 {
+    CELL.with(|c| c.get())
+}
+
+pub fn set_cell(scale: f64) {
+    CELL.with(|c| c.set((3.0 * scale).round().clamp(2.0, 5.0)));
+}
+
+/// Redondea a la rejilla.
+pub fn snap(v: f64) -> f64 {
+    (v / cell()).round() * cell()
 }
 
 pub fn water_colors(v: &View) -> (Rgb, Rgb) {
@@ -199,11 +154,11 @@ pub fn water_colors(v: &View) -> (Rgb, Rgb) {
 }
 
 fn water(cr: &Context, v: &View) {
-    for (y0, y1, c) in water_bands(v) {
-        rgba(cr, c, 1.0);
-        cr.rectangle(0.0, y0, v.tank.w, y1 - y0 + 0.5);
-        cr.fill_q();
-    }
+    let t = v.tank;
+    let (top, bot) = water_colors(v);
+    let _ = cr.set_source(lin(0.0, 0.0, 0.0, t.h, &[(0.0, top, 1.0), (1.0, bot, 1.0)]));
+    cr.rectangle(0.0, 0.0, t.w, t.h);
+    cr.fill_q();
 }
 
 pub fn rays(cr: &Context, v: &View, time: f64, boil: f64) {
@@ -216,7 +171,7 @@ pub fn rays(cr: &Context, v: &View, time: f64, boil: f64) {
         let x0 = t.w * (0.06 + 0.18 * i as f64) + (time * 0.15 + i as f64 * 1.7).sin() * t.w * 0.03;
         let bw = t.w * (0.025 + 0.012 * (i as f64 * 2.3).sin().abs());
         let end = t.h * 0.95;
-        rgba(cr, col, 0.08 * (1.0 - 0.5 * boil));
+        let _ = cr.set_source(lin(0.0, sy, 0.0, end, &[(0.0, col, 0.15 * (1.0 - 0.5 * boil)), (1.0, col, 0.0)]));
         cr.move_to(x0 - bw, sy);
         cr.line_to(x0 + bw, sy);
         cr.line_to(x0 + bw * 2.4 + slant, end);
@@ -230,10 +185,9 @@ pub fn rays(cr: &Context, v: &View, time: f64, boil: f64) {
 fn motes(cr: &Context, v: &View) {
     let (top, _) = water_colors(v);
     let col = lighten(top, 0.7);
-    let c = cell();
     for m in &v.tank.motes {
         rgba(cr, col, 0.10 + 0.22 * m.z);
-        cr.rectangle(snap(m.x), snap(m.y), c, c);
+        cr.arc(m.x, m.y, 0.7 + 1.4 * m.z, 0.0, 2.0 * PI);
         cr.fill_q();
     }
 }
@@ -682,7 +636,7 @@ fn draw_fin(cr: &Context, sp: &Spine, fd: &FinDef, up: bool, hh: f64, col: Rgb, 
         cr.line_to(base[k].0, base[k].1);
     }
     cr.close_path();
-    rgba(cr, col, 1.0);
+    rgba(cr, col, 0.80);
     cr.fill_q();
     if detail > 0 {
         rgba(cr, darken(col, 0.4), 0.25);
@@ -752,10 +706,11 @@ fn draw_tail(cr: &Context, sp: &Spine, def: &Species, len: f64, col: Rgb, phase:
         }
     }
     cr.close_path();
-    rgba(cr, col, 1.0);
+    let end_a = if def.tail == TailKind::Flowing { 0.3 } else { 0.6 };
+    let _ = cr.set_source(lin(0.0, 0.0, tl, 0.0, &[(0.0, darken(col, 0.1), 0.95), (1.0, lighten(col, 0.3), end_a)]));
     cr.fill_keep();
-    rgba(cr, darken(col, 0.5), 1.0);
-    cr.set_line_width(1.0);
+    rgba(cr, darken(col, 0.5), 0.35);
+    cr.set_line_width(0.8);
     cr.stroke_q();
     if detail > 0 {
         rgba(cr, darken(col, 0.5), 0.22);
@@ -786,40 +741,33 @@ fn paint_fish(cr: &Context, a: &FishArt, pal: &Palette) {
         crate::reef::fish::paint(cr, a, pal);
         return;
     }
-    paint_pixel_fish(cr, a, pal);
-}
-
-/// Pez del estilo estilizado, en unidades de celda (1 unidad = 1 píxel del sprite): colores planos
-/// del tema, contorno de una celda, ojo de una celda. Sin antialias: el sprite se amplía después con
-/// vecino más cercano para que cada celda sea un píxel gordo.
-fn paint_pixel_fish(cr: &Context, a: &FishArt, pal: &Palette) {
+    debug_assert!(a.style == Style::Cartoon);
     let def = &SPECIES_DEFS[a.look.species];
     let len = a.len;
-    let big = len >= 14.0;
-    let n = if len < 12.0 { 8 } else if len < 30.0 { 14 } else { 24 };
-    cr.set_antialias(cairo::Antialias::None);
-    cr.set_line_join(cairo::LineJoin::Miter);
-    cr.set_line_cap(cairo::LineCap::Square);
+    let detail: u8 = if len < 32.0 { 0 } else if len < 72.0 { 1 } else { 2 };
+    let n = match detail {
+        0 => 10,
+        1 => 18,
+        _ => 28,
+    };
 
-    let mut c1 = mix(pal.fish[a.look.c1], pal.bg, 0.12);
-    c1 = if a.look.tint > 0.0 { lighten(c1, a.look.tint * 0.10) } else { darken(c1, -a.look.tint * 0.10) };
-    let mut c2 = mix(pal.fish[a.look.c2], pal.bg, 0.12);
+    let mut c1 = pal.fish[a.look.c1];
+    c1 = if a.look.tint > 0.0 { lighten(c1, a.look.tint * 0.16) } else { darken(c1, -a.look.tint * 0.16) };
+    let mut c2 = pal.fish[a.look.c2];
     if a.dying {
-        c1 = mix(desat(c1, 0.7), pal.bg, 0.3);
-        c2 = mix(desat(c2, 0.7), pal.bg, 0.3);
+        c1 = desat(c1, 0.5);
+        c2 = desat(c2, 0.5);
     }
-    let ink = pal.dbg;
     let hh = def.ratio * len;
     let sp = Spine::new(def, len, a.phase, a.amp, n);
 
-    // Cola y aletas: un tono más oscuro del cuerpo con un poco del secundario; el secundario
-    // queda para el patrón, así cada pez tiene dos colores y no cuatro.
-    let fin_col = mix(darken(c1, 0.28), c2, 0.3);
-    draw_tail(cr, &sp, def, len, fin_col, a.phase, a.amp, 0);
-    draw_fin(cr, &sp, &def.dorsal, true, hh, fin_col, a.phase, 0);
-    draw_fin(cr, &sp, &def.anal, false, hh, fin_col, a.phase, 0);
+    // Cola y aletas dorsal/anal van detrás del cuerpo.
+    let fin_col = lighten(mix(c2, c1, 0.25), 0.08);
+    draw_tail(cr, &sp, def, len, fin_col, a.phase, a.amp, detail);
+    draw_fin(cr, &sp, &def.dorsal, true, hh, fin_col, a.phase, detail);
+    draw_fin(cr, &sp, &def.anal, false, hh, fin_col, a.phase, detail);
 
-    // Cuerpo: tres tonos planos (lomo, flanco, vientre) recortados por la silueta.
+    // Cuerpo: contraluz (lomo oscuro, vientre claro), tono de la cola y brillo del lomo.
     cr.new_path();
     trace_body(cr, &sp);
     let path = cr.copy_path();
@@ -829,49 +777,98 @@ fn paint_pixel_fish(cr: &Context, a: &FishArt, pal: &Palette) {
             cr.append_path(p);
         }
     };
-    rgba(cr, c1, 1.0);
+    let body = lin(
+        0.0,
+        -hh,
+        0.0,
+        hh * 1.05,
+        &[
+            (0.0, darken(c1, 0.45), 1.0),
+            (0.32, c1, 1.0),
+            (0.64, lighten(c1, 0.25), 1.0),
+            (1.0, lighten(c1, 0.70), 1.0),
+        ],
+    );
+    let _ = cr.set_source(&body);
     cr.fill_q();
-    cr.save_q();
+    let xn = len * 0.5;
+    let xt = len * 0.5 - len * (1.0 - def.tail_frac);
+    let _ = cr.set_source(lin(xn, 0.0, xt, 0.0, &[(0.0, c2, 0.0), (0.45, c2, 0.0), (1.0, c2, 0.62)]));
     repath(cr);
-    cr.clip();
-    rgba(cr, darken(c1, 0.22), 1.0);
-    cr.rectangle(-len, -hh * 1.2, 2.0 * len, hh * 0.8);
     cr.fill_q();
-    rgba(cr, lighten(c1, 0.22), 1.0);
-    cr.rectangle(-len, hh * 0.45, 2.0 * len, hh);
-    cr.fill_q();
-    if big {
-        pattern(cr, &a.look, &sp, hh, c2, 1);
-        // Agalla: una línea vertical de una celda.
-        let (p, nu, h) = sp.at(0.22);
-        rgba(cr, ink, 0.55);
-        cr.set_line_width(1.0);
-        cr.move_to(p.0 + nu.0 * h * 0.7, p.1 + nu.1 * h * 0.7);
-        cr.line_to(p.0 - nu.0 * h * 0.7, p.1 - nu.1 * h * 0.7);
-        cr.stroke_q();
+    if detail > 0 {
+        pattern(cr, &a.look, &sp, hh, c2, detail);
     }
-    cr.restore_q();
+    let _ = cr.set_source(lin(0.0, -hh, 0.0, -hh * 0.15, &[(0.0, (1.0, 1.0, 1.0), 0.30), (1.0, (1.0, 1.0, 1.0), 0.0)]));
     repath(cr);
-    rgba(cr, ink, 1.0);
-    cr.set_line_width(1.0);
+    cr.fill_q();
+    repath(cr);
+    rgba(cr, darken(c1, 0.6), 0.75);
+    cr.set_line_width((len * 0.008).max(0.8));
     cr.stroke_q();
 
-    // Ojo: una celda de tinta (dos con una de luz en los grandes).
+    // Aleta pectoral, agallas, boca y ojo.
+    if detail > 0 {
+        let (p, nu, h) = sp.at(0.27);
+        cr.save_q();
+        cr.translate(p.0 - nu.0 * h * 0.15, p.1 - nu.1 * h * 0.15);
+        let pl = def.pect * len;
+        cr.rotate(-0.35 + 0.35 * (a.phase + 1.0).sin());
+        cr.move_to(0.0, 0.0);
+        cr.curve_to(-0.4 * pl, -0.28 * pl, -0.95 * pl, -0.12 * pl, -pl, 0.10 * pl);
+        cr.curve_to(-0.7 * pl, 0.30 * pl, -0.25 * pl, 0.22 * pl, 0.0, 0.0);
+        rgba(cr, lighten(fin_col, 0.15), 0.72);
+        cr.fill_keep();
+        rgba(cr, darken(c1, 0.5), 0.4);
+        cr.set_line_width(0.8);
+        cr.stroke_q();
+        cr.restore_q();
+
+        let (p, nu, h) = sp.at(0.22);
+        rgba(cr, darken(c1, 0.6), 0.28);
+        cr.set_line_width((len * 0.008).max(0.8));
+        cr.move_to(p.0 + nu.0 * h * 0.85, p.1 + nu.1 * h * 0.85);
+        cr.curve_to(p.0 + nu.0 * h * 0.2 + h * 0.35, p.1 + nu.1 * h * 0.2, p.0 - nu.0 * h * 0.2 + h * 0.35, p.1 - nu.1 * h * 0.2, p.0 - nu.0 * h * 0.85, p.1 - nu.1 * h * 0.85);
+        cr.stroke_q();
+
+        let nose = sp.p[0];
+        rgba(cr, darken(c1, 0.7), 0.6);
+        cr.set_line_width((len * 0.009).max(0.9));
+        cr.move_to(nose.0 - len * 0.004, nose.1 + hh * 0.05);
+        cr.curve_to(nose.0 - len * 0.03, nose.1 + hh * 0.17, nose.0 - len * 0.06, nose.1 + hh * 0.17, nose.0 - len * 0.085, nose.1 + hh * 0.08);
+        cr.stroke_q();
+    }
+
     let (pe, nu, h) = sp.at(0.12);
-    let (ex, ey) = ((pe.0 + nu.0 * h * 0.30).floor(), (pe.1 + nu.1 * h * 0.30).floor());
-    rgba(cr, ink, 1.0);
-    if a.dying {
-        cr.rectangle(ex - 1.0, ey, 3.0, 1.0);
-        cr.rectangle(ex, ey - 1.0, 1.0, 3.0);
+    let (ex, ey) = (pe.0 + nu.0 * h * 0.30, pe.1 + nu.1 * h * 0.30);
+    let r = (len * 0.036 * def.eye + 0.6).clamp(1.3, 10.0 * def.eye);
+    if detail == 0 {
+        rgba(cr, (0.04, 0.04, 0.06), 0.95);
+        cr.arc(ex, ey, r, 0.0, 2.0 * PI);
         cr.fill_q();
-    } else if big {
-        cr.rectangle(ex, ey, 2.0, 2.0);
-        cr.fill_q();
-        rgba(cr, pal.bfg, 1.0);
-        cr.rectangle(ex, ey, 1.0, 1.0);
-        cr.fill_q();
+    } else if a.dying {
+        rgba(cr, (0.05, 0.05, 0.07), 0.95);
+        cr.set_line_width((r * 0.35).max(1.0));
+        cr.move_to(ex - r * 0.7, ey - r * 0.7);
+        cr.line_to(ex + r * 0.7, ey + r * 0.7);
+        cr.move_to(ex + r * 0.7, ey - r * 0.7);
+        cr.line_to(ex - r * 0.7, ey + r * 0.7);
+        cr.stroke_q();
     } else {
-        cr.rectangle(ex, ey, 1.0, 1.0);
+        rgba(cr, (0.03, 0.03, 0.05), 0.55);
+        cr.arc(ex, ey, r + 0.7, 0.0, 2.0 * PI);
+        cr.fill_q();
+        rgba(cr, (0.97, 0.97, 0.95), 1.0);
+        cr.arc(ex, ey, r, 0.0, 2.0 * PI);
+        cr.fill_q();
+        rgba(cr, lighten(c2, 0.2), 1.0);
+        cr.arc(ex + r * 0.12, ey, r * 0.74, 0.0, 2.0 * PI);
+        cr.fill_q();
+        rgba(cr, (0.02, 0.02, 0.04), 1.0);
+        cr.arc(ex + r * 0.2, ey, r * 0.5, 0.0, 2.0 * PI);
+        cr.fill_q();
+        rgba(cr, (1.0, 1.0, 1.0), 0.95);
+        cr.arc(ex + r * 0.05, ey - r * 0.28, r * 0.17, 0.0, 2.0 * PI);
         cr.fill_q();
     }
 }
@@ -892,7 +889,7 @@ pub struct SKey {
     pub phase: u8,
     pub amp: u8,
     pub dying: bool,
-    pub real: bool,
+    pub style: u8,
 }
 
 pub struct Sprite {
@@ -910,7 +907,6 @@ struct SpriteCache {
     bytes: usize,
     pal: String,
     ds: f64,
-    cell: f64,
 }
 
 thread_local! {
@@ -927,15 +923,25 @@ pub fn nphases(len: f64) -> usize {
 
 pub fn sprite_key(f: &Fish, style: Style) -> (SKey, f64) {
     let dying = matches!(f.life, Life::Dying(_));
-    // Realista: cubos logarítmicos y escalado suave. Estilizado: celdas enteras de la rejilla,
-    // porque un sprite de píxeles escalado a un tamaño fraccionario pierde la rejilla.
-    let (size, blen) = if style == Style::Realistic {
-        let size = ((f.len / 12.0).ln() / SIZE_STEP.ln()).round() as i16;
-        (size, 12.0 * SIZE_STEP.powi(size as i32))
-    } else {
-        let cells = (f.len / cell()).round().max(4.0);
-        (cells as i16, cells * cell())
-    };
+    if style == Style::Pixel {
+        // Sprite dibujado a mano: factor entero y uno de tres fotogramas de cola.
+        let k = crate::pixel::scale_of(&f.look, f.len);
+        let key = SKey {
+            species: crate::pixel::species_of(&f.look) as u8,
+            pattern: 0,
+            c1: f.look.c1 as u8,
+            c2: f.look.c2 as u8,
+            tint: (f.look.tint * 2.0).round() as i8,
+            size: k as i16,
+            phase: crate::pixel::frame_of(f) as u8,
+            amp: 0,
+            dying,
+            style: 1,
+        };
+        return (key, f.len);
+    }
+    let size = ((f.len / 12.0).ln() / SIZE_STEP.ln()).round() as i16;
+    let blen = 12.0 * SIZE_STEP.powi(size as i32);
     let np = nphases(f.len);
     let ph = ((f.phase / (2.0 * PI)).rem_euclid(1.0) * np as f64) as usize % np;
     let amp = if dying {
@@ -958,7 +964,7 @@ pub fn sprite_key(f: &Fish, style: Style) -> (SKey, f64) {
             phase: ph as u8,
             amp,
             dying,
-            real: style == Style::Realistic,
+            style: if style == Style::Realistic { 2 } else { 0 },
         },
         blen,
     )
@@ -969,17 +975,21 @@ fn blit_fish(cr: &Context, f: &Fish, pal: &Palette, ds: f64, style: Style) {
     let (key, blen) = sprite_key(f, style);
     SPRITES.with(|c| {
         let mut c = c.borrow_mut();
-        // La rejilla cambia con el tamaño de la pecera: los sprites de píxeles se rehacen.
-        if c.pal != pal.raw || (c.ds - ds).abs() > 0.01 || (c.cell - cell()).abs() > 0.01 {
+        if c.pal != pal.raw || (c.ds - ds).abs() > 0.01 {
             c.map.clear();
             c.bytes = 0;
             c.pal = pal.raw.clone();
             c.ds = ds;
-            c.cell = cell();
         }
         if c.bytes > MAX_SPRITE_BYTES {
             c.map.clear();
             c.bytes = 0;
+        }
+        if key.style == 1 {
+            let k = key.size as f64;
+            let spr = c.map.entry(key).or_insert_with(|| crate::pixel::render(&f.look, key.phase as usize, k, pal, key.dying));
+            crate::pixel::draw_sprite(cr, f, spr, k, f.alpha.clamp(0.0, 1.0));
+            return;
         }
         if !c.map.contains_key(&key) {
             let np = nphases(f.len);
@@ -1028,7 +1038,11 @@ pub(crate) fn reset_budget() {
 
 pub fn render_sprite(f: &Fish, key: &SKey, blen: f64, pal: &Palette, ds: f64) -> Sprite {
     let np = nphases(f.len);
-    let style = if key.real { Style::Realistic } else { Style::Cartoon };
+    let style = match key.style {
+        2 => Style::Realistic,
+        1 => Style::Pixel,
+        _ => Style::Cartoon,
+    };
     let art = FishArt {
         look: f.look,
         len: blen,
@@ -1038,7 +1052,10 @@ pub fn render_sprite(f: &Fish, key: &SKey, blen: f64, pal: &Palette, ds: f64) ->
         style,
     };
     // Caja que contiene cuerpo, aletas y la ondulación de la cola.
-    let (half_w, half_h) = if key.real {
+    if style == Style::Pixel {
+        return crate::pixel::render(&f.look, key.phase as usize, key.size as f64, pal, key.dying);
+    }
+    let (half_w, half_h) = if key.style == 2 {
         crate::reef::fish::extent(&f.look, blen, art.amp)
     } else {
         let def = &SPECIES_DEFS[f.look.species];
@@ -1046,19 +1063,6 @@ pub fn render_sprite(f: &Fish, key: &SKey, blen: f64, pal: &Palette, ds: f64) ->
         let fin_h = def.dorsal.h.max(def.anal.h) * hh * (1.0 + def.dorsal.lean.max(def.anal.lean) * 0.4);
         ((blen * 0.5 + 6.0), (hh * 1.1 + fin_h + blen * 0.17 * art.amp + 6.0).max(blen * 0.35))
     };
-    if !key.real {
-        // Sprite de píxeles: una celda por píxel, se amplía al dibujar con vecino más cercano.
-        let c = cell();
-        let art = FishArt { len: blen / c, ..art };
-        let (hw, hh) = ((half_w / c).ceil() + 1.0, (half_h / c).ceil() + 1.0);
-        let surf = cairo::ImageSurface::create(cairo::Format::ARgb32, (hw * 2.0) as i32, (hh * 2.0) as i32).expect("sprite");
-        {
-            let cx = Context::new(&surf).expect("cairo");
-            cx.translate(hw, hh);
-            paint_fish(&cx, &art, pal);
-        }
-        return Sprite { surf, ox: hw * c, oy: hh * c, len: blen };
-    }
     let (wl, hl) = (half_w * 2.0, half_h * 2.0);
     let (wp, hp) = ((wl * ds).ceil().max(2.0) as i32, (hl * ds).ceil().max(2.0) as i32);
     let surf = cairo::ImageSurface::create(cairo::Format::ARgb32, wp, hp).expect("sprite");
@@ -1074,7 +1078,7 @@ pub fn render_sprite(f: &Fish, key: &SKey, blen: f64, pal: &Palette, ds: f64) ->
 /// Atenuación por distancia: en el estilo realista los peces pequeños se funden con el agua.
 pub fn depth_alpha(f: &Fish, style: Style) -> f64 {
     match style {
-        Style::Cartoon => 1.0,
+        Style::Cartoon | Style::Pixel => 1.0,
         Style::Realistic => {
             let t = ((f.len - 16.0) / 74.0).clamp(0.0, 1.0);
             0.62 + 0.38 * t * t * (3.0 - 2.0 * t)
@@ -1084,21 +1088,12 @@ pub fn depth_alpha(f: &Fish, style: Style) -> f64 {
 
 fn draw_sprite(cr: &Context, f: &Fish, s: &Sprite, style: Style) {
     cr.save_q();
-    if style == Style::Cartoon {
-        // Píxeles: posición en la rejilla, sin giro ni escalado fraccionario.
-        let c = cell();
-        cr.translate(snap(f.x), snap(f.y));
-        cr.scale(nz(f.face).signum() * c, nz(f.flipv).signum() * c);
-        let _ = cr.set_source_surface(&s.surf, -s.ox / c, -s.oy / c);
-        cr.source().set_filter(cairo::Filter::Nearest);
-    } else {
-        cr.translate(f.x, f.y);
-        cr.scale(nz(f.face), nz(f.flipv));
-        cr.rotate(-f.pitch);
-        let k = f.len / s.len;
-        cr.scale(k, k);
-        let _ = cr.set_source_surface(&s.surf, -s.ox, -s.oy);
-    }
+    cr.translate(f.x, f.y);
+    cr.scale(nz(f.face), nz(f.flipv));
+    cr.rotate(-f.pitch);
+    let k = f.len / s.len;
+    cr.scale(k, k);
+    let _ = cr.set_source_surface(&s.surf, -s.ox, -s.oy);
     let _ = cr.paint_with_alpha((f.alpha * depth_alpha(f, style)).clamp(0.0, 1.0));
     cr.restore_q();
 }
@@ -1107,6 +1102,7 @@ fn draw_sprite(cr: &Context, f: &Fish, s: &Sprite, style: Style) {
 pub fn body_half_height(f: &Fish, style: Style) -> f64 {
     match style {
         Style::Cartoon => SPECIES_DEFS[f.look.species].ratio * f.len,
+        Style::Pixel => f.len * 0.32,
         Style::Realistic => crate::reef::species::SPECIES[f.look.real].ratio * f.len,
     }
 }
@@ -1216,35 +1212,31 @@ pub(crate) fn bubbles(cr: &Context, v: &View) {
     let t = v.tank;
     let (top, _) = water_colors(v);
     let col = lighten(top, 0.85);
-    let c = cell();
-    // Burbujas de píxeles: un cuadrado hueco (o una celda si es diminuta), en la rejilla.
-    for b in &t.bubbles {
-        let k = (b.r * 2.0 / c).round().clamp(1.0, 4.0);
-        let (x, y) = (snap(b.x - b.r), snap(b.y - b.r));
-        match b.kind {
-            BubbleKind::Air if k <= 1.0 => {
-                rgba(cr, col, 0.55);
-                cr.rectangle(x, y, c, c);
-                cr.fill_q();
-            }
-            BubbleKind::Air => {
-                rgba(cr, col, 0.12);
-                cr.rectangle(x, y, k * c, k * c);
-                cr.fill_q();
-                rgba(cr, col, 0.45);
-                cr.rectangle(x, y, k * c, c);
-                cr.rectangle(x, y + (k - 1.0) * c, k * c, c);
-                cr.rectangle(x, y, c, k * c);
-                cr.rectangle(x + (k - 1.0) * c, y, c, k * c);
-                cr.fill_q();
-            }
-            BubbleKind::Foam => {
-                let a = (b.life / b.max_life).clamp(0.0, 1.0);
-                rgba(cr, v.pal.bfg, 0.40 * a.sqrt());
-                cr.rectangle(x, y, k * c, c);
-                cr.fill_q();
-            }
-        }
+    rgba(cr, col, 0.10);
+    for b in t.bubbles.iter().filter(|b| b.kind == BubbleKind::Air) {
+        cr.new_sub_path();
+        cr.arc(b.x, b.y, b.r, 0.0, 2.0 * PI);
+    }
+    cr.fill_q();
+    rgba(cr, col, 0.55);
+    cr.set_line_width(1.0);
+    for b in t.bubbles.iter().filter(|b| b.kind == BubbleKind::Air && b.r > 1.8) {
+        cr.new_sub_path();
+        cr.arc(b.x, b.y, b.r, 0.0, 2.0 * PI);
+    }
+    cr.stroke_q();
+    rgba(cr, (1.0, 1.0, 1.0), 0.7);
+    for b in t.bubbles.iter().filter(|b| b.kind == BubbleKind::Air && b.r > 3.5) {
+        cr.new_sub_path();
+        cr.arc(b.x - b.r * 0.3, b.y - b.r * 0.3, b.r * 0.22, 0.0, 2.0 * PI);
+    }
+    cr.fill_q();
+    // Espuma en la superficie.
+    for b in t.bubbles.iter().filter(|b| b.kind == BubbleKind::Foam) {
+        let k = (b.life / b.max_life).clamp(0.0, 1.0);
+        rgba(cr, (1.0, 1.0, 1.0), 0.40 * k.sqrt());
+        cr.arc(b.x, b.y, b.r, 0.0, 2.0 * PI);
+        cr.fill_q();
     }
 }
 
@@ -1268,25 +1260,40 @@ pub(crate) fn surface_path(cr: &Context, t: &Tank) {
 pub fn surface(cr: &Context, v: &View) {
     let t = v.tank;
     let p = v.pal;
-    let c = cell();
-    cr.set_antialias(cairo::Antialias::None);
-    // Aire por encima del agua y una línea de una celda en la superficie, escalonada en la rejilla.
+    // Aire por encima del agua.
+    surface_path(cr, t);
+    cr.line_to(t.w, 0.0);
+    cr.line_to(0.0, 0.0);
+    cr.close_path();
+    rgba(cr, p.dbg, 1.0);
+    cr.fill_q();
     let (top, _) = water_colors(v);
-    let mut x = 0.0;
-    while x < t.w {
-        let y = snap(surface_at(t, x + c / 2.0));
-        rgba(cr, p.dbg, 1.0);
-        cr.rectangle(x, 0.0, c, y);
-        cr.fill_q();
-        rgba(cr, lighten(top, 0.75), 0.7);
-        cr.rectangle(x, y, c, c);
-        cr.fill_q();
-        x += c;
+    surface_path(cr, t);
+    rgba(cr, lighten(top, 0.75), 0.55);
+    cr.set_line_width(2.0);
+    cr.stroke_q();
+    cr.save_q();
+    cr.translate(0.0, 5.0);
+    surface_path(cr, t);
+    rgba(cr, lighten(top, 0.6), 0.14);
+    cr.set_line_width(3.0);
+    cr.stroke_q();
+    cr.restore_q();
+    // Ondas donde revientan las burbujas.
+    for &(x, age) in &t.ripples {
+        let k = age / 0.9;
+        rgba(cr, lighten(top, 0.8), 0.5 * (1.0 - k));
+        cr.set_line_width(1.2);
+        cr.save_q();
+        cr.translate(x, surface_at(t, x) + 1.5);
+        cr.scale(1.0, 0.28);
+        cr.arc(0.0, 0.0, 3.0 + 18.0 * k, 0.0, 2.0 * PI);
+        cr.restore_q();
+        cr.stroke_q();
     }
-    cr.set_antialias(cairo::Antialias::Default);
 }
 
-fn overlays(cr: &Context, v: &View) {
+pub(crate) fn overlays(cr: &Context, v: &View) {
     let t = v.tank;
     let (w, h) = (t.w, t.h);
     // Turbidez: con la RAM llena el agua se enturbia.

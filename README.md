@@ -19,12 +19,16 @@ Built with **Rust** (GTK4 + Libadwaita), themed from the active **Omarchy** them
 
 Fish are procedural (spine‑driven body, tail and fins), not flat sprites.
 
-## Two visual styles
+## Three visual styles
 
-Press **`T`** (or click the style button in the header) to switch; the choice is remembered
-(`~/.config/thermalacuarium/style`, or start with `--style real|stylized`).
+Press **`T`** (or click the style button in the header) to cycle; the choice is remembered
+(`~/.config/thermalacuarium/style`, or start with `--style stylized|pixel|real`).
 
-- **Stylized** (default): pixel art in the spirit of the Omarchy logo. Fish, bubbles and corals sit on one shared pixel grid, painted flat with your Omarchy theme colors (no gradients, no gloss), with a one‑pixel ink outline and a one‑pixel eye. It recolors live when you change theme.
+- **Stylized** (default): soft procedural fish painted with your Omarchy theme colors.
+- **Pixel**: pixel art in the spirit of the Omarchy logo. Seven hand‑drawn species (tropical, tetra,
+  angelfish, puffer, betta, torpedo, discus) with three tail frames, flat theme colors and a
+  one‑pixel ink outline. A process's size is the sprite's integer zoom: a 1 MB process is a 1× fish,
+  an 8 GB one is an 8× fish. Bubbles, light shafts and corals share one pixel grid.
 - **Realistic**: a reef aquarium. 15 species with real anatomy and coloring (clownfish, blue and
   yellow tang, royal gramma, chromis, butterflyfish, angelfish, mandarin dragonet, anthias, cardinalfish,
   damselfish, pufferfish, wrasse, lionfish, grouper) with countershading, scales, fin rays and
@@ -33,12 +37,12 @@ Press **`T`** (or click the style button in the header) to switch; the choice is
   kelp, sea fans, brain coral and bubble‑tip anemones for the protected processes. Boiling water
   turns amber with glassy bubbles.
 
-The realistic style is naturalistic, not photographic. It **reads the active Omarchy theme** and adapts
-to it: the water, light shafts, reef wall, rocks, sand tint, glass and air take their hue from the theme's
-blue/cyan, dark themes give a night tank and light themes (catppuccin-latte, flexoki-light, white…) a
-bright daytime tank, and fish get a faint tint of that water. Species keep their natural colors (a
-clownfish is still orange). It follows theme changes live (it watches Omarchy's theme folder: run `omarchy theme set …` and the window and the tank recolor within a second, no restart); try other themes without
-changing yours with `thermalacuarium --theme gruvbox`.
+All three **read the active Omarchy theme** and follow theme changes live (run `omarchy theme set …`
+and the window and the tank recolor within a second). In the realistic style the water, light shafts,
+reef wall, rocks, sand tint, glass and air take their hue from the theme's blue/cyan, dark themes give a
+night tank and light themes a bright daytime tank, and fish get a faint tint of that water; species keep
+their natural colors (a clownfish is still orange). Preview other themes without changing yours with
+`thermalacuarium --theme gruvbox`.
 
 ## Use
 
@@ -100,7 +104,8 @@ It is a normal (tiled) window; no Hyprland rules needed.
 thermalacuarium --temp 95          # force the water temperature to preview the boil
 THERMALACUARIUM_LANG=es thermalacuarium
 thermalacuarium --snapshot out.png [--style real] [--size 1180x680] [--seconds 8] [--temp 99] [--demo] [--dying 3] [--names 1] [--hover 600,300] [--bench]
-thermalacuarium --snapshot gallery.png --gallery --style real --len 210   # all species
+thermalacuarium --snapshot gallery.png --gallery --style real --len 210   # all reef species
+thermalacuarium --snapshot gallery.png --gallery --style pixel --len 300  # all pixel species
 thermalacuarium --theme nord       # preview another Omarchy theme (or THERMALACUARIUM_THEME=nord)
 thermalacuarium --new-instance     # open another window without activating the running one
 ```
@@ -119,8 +124,8 @@ Telemetry code (`/proc`, `/sys/class/hwmon`) and theming come from ThermalWatch.
 
 ## Screenshots
 
-| Boiling water (realistic) | Stylized | Species |
-| :--- | :--- | :--- |
-| ![](docs/boiling.png) | ![](docs/stylized.png) | ![](docs/species.png) |
+| Boiling water (realistic) | Stylized | Pixel | Reef species |
+| :--- | :--- | :--- | :--- |
+| ![](docs/boiling.png) | ![](docs/stylized.png) | ![](docs/pixel.png) | ![](docs/species.png) |
 
 (Rendered with `--snapshot --demo`.)

@@ -5,6 +5,7 @@
 mod draw;
 mod gpu;
 mod i18n;
+mod pixel;
 mod reef;
 mod sim;
 mod sys;
@@ -141,6 +142,7 @@ fn sample_procs(ui: &Rc<Ui>) {
 fn style_name(s: Style) -> &'static str {
     match s {
         Style::Cartoon => tr("style_toon"),
+        Style::Pixel => tr("style_pixel"),
         Style::Realistic => tr("style_real"),
     }
 }
@@ -514,7 +516,11 @@ fn snapshot(path: &str) {
         {
             let cr = cairo::Context::new(&surf).expect("cairo");
             let len: f64 = arg_val("--len").and_then(|s| s.parse().ok()).unwrap_or(150.0);
-            reef::scene::gallery(&cr, w as f64, h as f64, len, &font, &pal);
+            if style == Style::Pixel {
+                pixel::gallery(&cr, w as f64, h as f64, len, &font, &pal);
+            } else {
+                reef::scene::gallery(&cr, w as f64, h as f64, len, &font, &pal);
+            }
         }
         let mut file = std::fs::File::create(path).expect("no se pudo crear el PNG");
         surf.write_to_png(&mut file).expect("no se pudo escribir el PNG");

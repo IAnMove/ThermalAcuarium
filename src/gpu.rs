@@ -126,16 +126,6 @@ pub(crate) fn texture_of(mut surf: cairo::ImageSurface) -> Option<gdk::MemoryTex
 }
 
 /// Pinta con Cairo una capa de `w`×`h` px lógicos a escala `ds` y la convierte en textura.
-fn bake(w: f64, h: f64, ds: f64, paint: impl FnOnce(&cairo::Context)) -> Option<gdk::MemoryTexture> {
-    let surf = cairo::ImageSurface::create(cairo::Format::ARgb32, (w * ds).ceil().max(1.0) as i32, (h * ds).ceil().max(1.0) as i32).ok()?;
-    surf.set_device_scale(ds, ds);
-    {
-        let cr = cairo::Context::new(&surf).ok()?;
-        paint(&cr);
-    }
-    texture_of(surf)
-}
-
 /// Como `bake`, pero a una celda por píxel: se amplía luego con `ScalingFilter::Nearest`.
 fn bake_px(w: f64, h: f64, cell: f64, paint: impl FnOnce(&cairo::Context)) -> Option<gdk::MemoryTexture> {
     let surf = cairo::ImageSurface::create(cairo::Format::ARgb32, (w / cell).ceil().max(1.0) as i32, (h / cell).ceil().max(1.0) as i32).ok()?;
@@ -143,6 +133,16 @@ fn bake_px(w: f64, h: f64, cell: f64, paint: impl FnOnce(&cairo::Context)) -> Op
         let cr = cairo::Context::new(&surf).ok()?;
         cr.set_antialias(cairo::Antialias::None);
         cr.scale(1.0 / cell, 1.0 / cell);
+        paint(&cr);
+    }
+    texture_of(surf)
+}
+
+fn bake(w: f64, h: f64, ds: f64, paint: impl FnOnce(&cairo::Context)) -> Option<gdk::MemoryTexture> {
+    let surf = cairo::ImageSurface::create(cairo::Format::ARgb32, (w * ds).ceil().max(1.0) as i32, (h * ds).ceil().max(1.0) as i32).ok()?;
+    surf.set_device_scale(ds, ds);
+    {
+        let cr = cairo::Context::new(&surf).ok()?;
         paint(&cr);
     }
     texture_of(surf)
@@ -248,26 +248,36 @@ pub fn render(widget: &gtk::Widget, snap: &gtk::Snapshot, v: &View, cache: &mut 
         return;
     }
 
+    let px = v.style == Style::Pixel;
     draw::set_cell(t.scale());
     let cell = draw::cell();
     let full = rect(0.0, 0.0, w, h);
-    let (top_c, _) = draw::water_colors(v);
+    let (top_c, bot_c) = draw::water_colors(v);
     let b = t.boil;
 
-    // Agua: franjas planas.
-    for (y0, y1, c) in draw::water_bands(v) {
-        snap.append_color(&col(c, 1.0), &rect(0.0, y0, w, y1 - y0 + 0.5));
+    // Agua: degradado, o franjas planas en el estilo Pixel.
+    if px {
+        for (y0, y1, c) in crate::pixel::water_bands(v) {
+            snap.append_color(&col(c, 1.0), &rect(0.0, y0, w, y1 - y0 + 0.5));
+        }
+    } else {
+        snap.append_linear_gradient(&full, &pt(0.0, 0.0), &pt(0.0, h), &stops(&[(0.0, top_c, 1.0), (1.0, bot_c, 1.0)]));
     }
 
-    // Rayos de luz: una textura de píxeles estática que se desplaza a saltos de celda.
+    // Rayos de luz: una textura estática que se desplaza despacio.
     if cache.rays.is_none() {
-        cache.rays = bake_px(w, h, cell, |cr| draw::rays(cr, v, 0.0, 0.0));
+        cache.rays = if px { bake_px(w, h, cell, |cr| draw::rays(cr, v, 0.0, 0.0)) } else { bake(w, h, ds, |cr| draw::rays(cr, v, 0.0, 0.0)) };
     }
     if let Some(tex) = &cache.rays {
         snap.save();
-        snap.translate(&pt(draw::snap((t.t * 0.15).sin() * w * 0.03), 0.0));
+        let dx = (t.t * 0.15).sin() * w * 0.03;
+        snap.translate(&pt(if px { draw::snap(dx) } else { dx }, 0.0));
         snap.push_opacity(1.0 - 0.5 * b);
-        snap.append_scaled_texture(tex, gsk::ScalingFilter::Nearest, &full);
+        if px {
+            snap.append_scaled_texture(tex, gsk::ScalingFilter::Nearest, &full);
+        } else {
+            snap.append_texture(tex, &full);
+        }
         snap.pop();
         snap.restore();
     }
@@ -275,9 +285,14 @@ pub fn render(widget: &gtk::Widget, snap: &gtk::Snapshot, v: &View, cache: &mut 
     // Nieve marina.
     let mote = col(lighten(top_c, 0.7), 1.0);
     for m in &t.motes {
+        let r = 0.7 + 1.4 * m.z;
         let mut c = mote;
         c.set_alpha((0.10 + 0.22 * m.z) as f32);
-        snap.append_color(&c, &rect(draw::snap(m.x), draw::snap(m.y), cell, cell));
+        if px {
+            snap.append_color(&c, &rect(draw::snap(m.x), draw::snap(m.y), cell, cell));
+        } else {
+            snap.append_color(&c, &rect(m.x - r, m.y - r, 2.0 * r, 2.0 * r));
+        }
     }
 
     // Resplandor del fondo, arena, brillo de los respiraderos.
@@ -342,13 +357,21 @@ pub fn render(widget: &gtk::Widget, snap: &gtk::Snapshot, v: &View, cache: &mut 
     for &i in &t.order {
         fish(snap, cache, v, i, ds);
     }
-    bubbles(snap, v, top_c);
+    if px {
+        pixel_bubbles(snap, v, top_c);
+    } else {
+        bubbles(snap, v, top_c);
+    }
 
     // Superficie: una franja fina que sí se repinta cada fotograma.
     let strip = t.surface_y() + 30.0 * t.scale();
     {
         let cr = snap.append_cairo(&rect(0.0, 0.0, w, strip));
-        draw::surface(&cr, v);
+        if px {
+            crate::pixel::surface(&cr, v);
+        } else {
+            draw::surface(&cr, v);
+        }
     }
 
     // Turbidez, viñeta y tinte de calor.
@@ -390,6 +413,7 @@ pub fn render(widget: &gtk::Widget, snap: &gtk::Snapshot, v: &View, cache: &mut 
 
 fn decor(snap: &gtk::Snapshot, cache: &mut GpuCache, v: &View, ds: f64) {
     let t = v.tank;
+    let px = v.style == Style::Pixel;
     // Se repinta a pocos Hz: la decoración se mece despacio y Cairo es lo más caro del fotograma.
     let stamp = (t.t * DECOR_HZ).floor() as i64;
     if stamp != cache.decor_stamp || cache.decor.len() != t.decor.len() {
@@ -400,19 +424,27 @@ fn decor(snap: &gtk::Snapshot, cache: &mut GpuCache, v: &View, ds: f64) {
             .enumerate()
             .filter_map(|(i, d)| {
                 let (bx, by, bw, bh) = draw::decor_box(t, d);
-                let _ = (i, ds);
-                let tex = bake_px(bw, bh, draw::cell(), |cr| {
-                    cr.translate(-bx, -by);
-                    draw::decor(cr, v, d, false);
-                })?;
-                Some(DecorTex { tex, rect: rect(draw::snap(bx), draw::snap(by), bw, bh) })
+                let hover = v.hover == Some(Pick::Decor(i));
+                let tex = if px {
+                    bake_px(bw, bh, draw::cell(), |cr| {
+                        cr.translate(-bx, -by);
+                        draw::decor(cr, v, d, hover);
+                    })?
+                } else {
+                    bake(bw, bh, ds, |cr| {
+                        cr.translate(-bx, -by);
+                        draw::decor(cr, v, d, hover);
+                    })?
+                };
+                Some(DecorTex { tex, rect: rect(bx, by, bw, bh) })
             })
             .collect();
     }
-    for (i, d) in cache.decor.iter().enumerate() {
-        snap.append_scaled_texture(&d.tex, gsk::ScalingFilter::Nearest, &d.rect);
-        if v.hover == Some(Pick::Decor(i)) {
-            outline(snap, &d.rect, &col(v.pal.accent, 0.6));
+    for d in &cache.decor {
+        if px {
+            snap.append_scaled_texture(&d.tex, gsk::ScalingFilter::Nearest, &d.rect);
+        } else {
+            snap.append_texture(&d.tex, &d.rect);
         }
     }
 }
@@ -441,8 +473,8 @@ fn sprite<'a>(cache: &'a mut GpuCache, v: &View, i: usize, ds: f64) -> Option<&'
         let (wp, hp) = (spr.surf.width(), spr.surf.height());
         let tex = texture_of(spr.surf)?;
         cache.bytes += (wp * hp * 4) as usize;
-        // Los sprites de píxeles no llevan escala de dispositivo: una celda por píxel.
-        let k = if key.real { 1.0 / ds } else { draw::cell() };
+        // Los sprites de píxeles no llevan escala de dispositivo: se amplían por su factor entero.
+        let k = if key.style == 1 { key.size as f64 } else { 1.0 / ds };
         cache.sprites.insert(
             key,
             GpuSprite { tex, w: (wp as f64 * k) as f32, h: (hp as f64 * k) as f32, ox: spr.ox as f32, oy: spr.oy as f32, len: spr.len },
@@ -458,10 +490,10 @@ pub(crate) fn fish(snap: &gtk::Snapshot, cache: &mut GpuCache, v: &View, i: usiz
     }
     let hl = v.hover == Some(Pick::Fish(i));
     let Some(s) = sprite(cache, v, i, ds) else { return };
-    let pixel = v.style == Style::Cartoon;
+    let px = v.style == Style::Pixel;
     let nz = |x: f64| if x.abs() < 0.03 { 0.03f64.copysign(if x == 0.0 { 1.0 } else { x }) } else { x } as f32;
     snap.save();
-    if pixel {
+    if px {
         // Píxeles: posición en la rejilla, volteo entero, sin giro ni escalado fraccionario.
         snap.translate(&pt(draw::snap(f.x), draw::snap(f.y)));
         snap.scale(nz(f.face).signum(), nz(f.flipv).signum());
@@ -478,7 +510,7 @@ pub(crate) fn fish(snap: &gtk::Snapshot, cache: &mut GpuCache, v: &View, i: usiz
         snap.push_opacity(alpha.clamp(0.0, 1.0));
     }
     let bounds = graphene::Rect::new(-s.ox, -s.oy, s.w, s.h);
-    if pixel {
+    if px {
         snap.append_scaled_texture(&s.tex, gsk::ScalingFilter::Nearest, &bounds);
     } else {
         snap.append_texture(&s.tex, &bounds);
@@ -503,6 +535,36 @@ pub(crate) fn fish(snap: &gtk::Snapshot, cache: &mut GpuCache, v: &View, i: usiz
 // ---------------------------------------------------------------- burbujas
 
 fn bubbles(snap: &gtk::Snapshot, v: &View, top_c: Rgb) {
+    let c = lighten(top_c, 0.85);
+    let (ring_c, fill_c, hi_c) = (col(c, 0.55), col(c, 0.10), col((1.0, 1.0, 1.0), 0.7));
+    for b in &v.tank.bubbles {
+        match b.kind {
+            BubbleKind::Air => {
+                let r = b.r;
+                if r < 1.8 {
+                    // Las diminutas son un punto.
+                    snap.append_color(&col(c, 0.4), &rect(b.x - r, b.y - r, 2.0 * r, 2.0 * r));
+                    continue;
+                }
+                let bounds = rect(b.x - r, b.y - r, 2.0 * r, 2.0 * r);
+                if r > 2.5 {
+                    disc(snap, &bounds, r as f32, &fill_c);
+                }
+                ring(snap, &bounds, r as f32, 1.0, &ring_c);
+                if r > 3.5 {
+                    snap.append_color(&hi_c, &rect(b.x - b.r * 0.41, b.y - b.r * 0.41, b.r * 0.44, b.r * 0.44));
+                }
+            }
+            BubbleKind::Foam => {
+                let k = (b.life / b.max_life).clamp(0.0, 1.0);
+                disc(snap, &rect(b.x - b.r, b.y - b.r, 2.0 * b.r, 2.0 * b.r), b.r as f32, &col((1.0, 1.0, 1.0), 0.40 * k.sqrt()));
+            }
+        }
+    }
+}
+
+/// Burbujas del estilo Pixel: cuadrados huecos en la rejilla.
+fn pixel_bubbles(snap: &gtk::Snapshot, v: &View, top_c: Rgb) {
     let c = lighten(top_c, 0.85);
     let cell = draw::cell();
     let (edge, fill, dot, foam) = (col(c, 0.45), col(c, 0.12), col(c, 0.55), col(v.pal.bfg, 1.0));
