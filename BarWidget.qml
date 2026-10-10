@@ -11,6 +11,14 @@ BarWidget {
     moduleName: "io.github.ianmove.thermalacuarium"
     property string tempText: "--°"
 
+    // Carpeta del plugin: el lanzador portátil está ahí y no hace falta instalar nada. La primera
+    // vez baja el binario de la release (sha256 comprobado) a `bin/`.
+    readonly property string dir: decodeURIComponent(Qt.resolvedUrl(".").toString().replace(/^file:\/\//, "")).replace(/\/$/, "")
+    function launch(extra) {
+        if (root.bar)
+            root.bar.run("bash '" + root.dir + "/thermalacuarium.sh'" + (extra ? " " + extra : ""));
+    }
+
     implicitHeight: button.implicitHeight
     implicitWidth: button.implicitWidth
 
@@ -46,16 +54,13 @@ BarWidget {
         anchors.fill: parent
         bar: root.bar
         text: (root.isHot ? "🫧 " : "🐠 ") + root.tempText
-        tooltipText: "ThermalAcuarium · Clic: abrir el acuario · Clic derecho: otra ventana"
+        tooltipText: "ThermalAcuarium · Clic: abrir el acuario (la primera vez descarga la app) · Clic derecho: otra ventana"
 
         onPressed: function(btn) {
-            if (!root.bar)
-                return;
-            if (btn === Qt.RightButton) {
-                root.bar.run("thermalacuarium --new-instance");
-            } else {
-                root.bar.run("thermalacuarium");
-            }
+            if (btn === Qt.RightButton)
+                root.launch("--new-instance");
+            else
+                root.launch("");
         }
     }
 }

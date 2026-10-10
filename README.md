@@ -50,30 +50,46 @@ changing yours with `thermalacuarium --theme gruvbox`.
 
 Only processes of your own user are shown. The tank holds the 180 biggest.
 
-## Install
+## Install / run
 
-### As an Omarchy shell plugin (bar widget)
+Nothing needs to be installed: the app is one file that only needs **GTK 4 and libadwaita**
+(already part of Omarchy).
 
-```bash
-git clone https://github.com/IAnMove/ThermalAcuarium && cd ThermalAcuarium
-./install.sh --plugin    # builds the app, installs it, and adds + enables the bar widget
-```
-
-or step by step (the widget needs the app installed first):
+### Omarchy plugin (recommended)
 
 ```bash
-./install.sh
 omarchy plugin add https://github.com/IAnMove/ThermalAcuarium --enable
-omarchy bar move io.github.ianmove.thermalacuarium --section right   # left | center | right
 ```
 
-The widget shows the CPU temperature (🐠, or 🫧 when the water would be boiling); click it to open the
-aquarium, right‑click to open another window.
+That is all. The bar widget shows the CPU temperature (🐠, or 🫧 when the water would be boiling).
+The first time you click it, the plugin downloads the app (~1.5 MB, from this repo's releases, with its
+sha256 checked) into its own folder and opens it; after that it starts instantly. Click opens the
+aquarium, right‑click opens another window. `omarchy plugin update` keeps it current (the launcher
+fetches the binary of the new version when `manifest.json` changes).
 
-### Standalone
+Move the widget with `omarchy bar move io.github.ianmove.thermalacuarium --section left|center|right`.
+
+### Portable (no installation, no plugin)
 
 ```bash
-./install.sh   # builds, installs ~/.local/bin/thermalacuarium and a desktop entry
+curl -L -o thermalacuarium https://github.com/IAnMove/ThermalAcuarium/releases/latest/download/thermalacuarium-x86_64-linux
+chmod +x thermalacuarium && ./thermalacuarium
+```
+
+or from a clone, with the same launcher the plugin uses (downloads the binary, or builds it with
+`cargo` if it cannot; `THERMALACUARIUM_BUILD=1` forces building from source):
+
+```bash
+git clone https://github.com/IAnMove/ThermalAcuarium && ./ThermalAcuarium/thermalacuarium.sh
+```
+
+It writes nothing outside `~/.config/thermalacuarium/style` (only if you switch style).
+
+### Installed (PATH + app menu entry)
+
+```bash
+./install.sh            # builds, installs ~/.local/bin/thermalacuarium and a desktop entry
+./install.sh --plugin   # ...and also adds the Omarchy bar widget
 ```
 
 It is a normal (tiled) window; no Hyprland rules needed.

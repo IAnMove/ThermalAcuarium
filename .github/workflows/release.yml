@@ -1,0 +1,33 @@
+# Compila el binario en un Arch limpio (las mismas bibliotecas que Omarchy) y lo publica como
+# release cuando se sube una etiqueta vX.Y.Z. El lanzador portátil (thermalacuarium.sh) descarga
+# de aquí el binario de la versión que indica manifest.json y comprueba su sha256.
+name: release
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    container: archlinux:latest
+    steps:
+      - name: Dependencias
+        run: pacman -Syu --noconfirm --needed base-devel git rust gtk4 libadwaita github-cli
+      - uses: actions/checkout@v4
+      - name: Compilar
+        run: cargo build --release --locked
+      - name: Empaquetar
+        run: |
+          cp target/release/thermalacuarium thermalacuarium-x86_64-linux
+          sha256sum thermalacuarium-x86_64-linux > thermalacuarium-x86_64-linux.sha256
+          cat thermalacuarium-x86_64-linux.sha256
+      - name: Publicar la release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh release create "$GITHUB_REF_NAME" thermalacuarium-x86_64-linux thermalacuarium-x86_64-linux.sha256 \
+            --repo "$GITHUB_REPOSITORY" --title "ThermalAcuarium $GITHUB_REF_NAME" --generate-notes
