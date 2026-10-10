@@ -72,6 +72,8 @@ pub struct Weather {
     rng: Rng,
     cache_key: RefCell<Option<(i32, i32, u64)>>,
     land: RefCell<Option<ImageSurface>>,
+    sky_key: RefCell<Option<i32>>,
+    sky: RefCell<Option<ImageSurface>>,
 }
 
 impl Weather {
@@ -110,6 +112,8 @@ impl Weather {
             rng,
             cache_key: RefCell::new(None),
             land: RefCell::new(None),
+            sky_key: RefCell::new(None),
+            sky: RefCell::new(None),
         }
     }
 
@@ -305,24 +309,34 @@ impl Weather {
         let fs = (11.0 * sc).clamp(10.0, 14.0);
         cr.set_font_size(fs);
 
-        // Cielo.
+        // Cielo y sol: se hornean por grado de temperatura (cambian despacio).
         let (top, hzc) = self.sky(pal);
-        let _ = cr.set_source(lin(0.0, 0.0, 0.0, hz, &[(0.0, top, 1.0), (1.0, hzc, 1.0)]));
-        cr.rectangle(0.0, 0.0, w, h);
-        cr.fill_q();
-        // Sol: más grande, más bajo y más rojo cuanto más calor.
-        let (sx, sy) = (w * 0.72, hz * (0.22 + 0.45 * heat));
-        let sr = (28.0 + 60.0 * heat) * sc;
-        let sun = mix(mix((1.0, 0.97, 0.85), (1.0, 0.55, 0.15), hot), (0.9, 0.2, 0.05), crit);
-        let g = RadialGradient::new(sx, sy, sr * 0.6, sx, sy, sr * (3.0 + 2.0 * hot));
-        g.add_color_stop_rgba(0.0, sun.0, sun.1, sun.2, 0.55 + 0.3 * hot);
-        g.add_color_stop_rgba(1.0, sun.0, sun.1, sun.2, 0.0);
-        let _ = cr.set_source(&g);
-        cr.rectangle(0.0, 0.0, w, hz);
-        cr.fill_q();
-        rgba(cr, sun, 1.0);
-        cr.arc(sx, sy, sr, 0.0, 2.0 * PI);
-        cr.fill_q();
+        let skey = (self.temp * 2.0).round() as i32;
+        if *self.sky_key.borrow() != Some(skey) || self.sky.borrow().is_none() {
+            let s = ImageSurface::create(cairo::Format::ARgb32, w.ceil() as i32, hz.ceil() as i32 + 1).expect("sky");
+            {
+                let c = &Context::new(&s).expect("cairo");
+                let _ = c.set_source(lin(0.0, 0.0, 0.0, hz, &[(0.0, top, 1.0), (1.0, hzc, 1.0)]));
+                c.paint_q();
+                let (sx, sy) = (w * 0.72, hz * (0.22 + 0.45 * heat));
+                let sr = (28.0 + 60.0 * heat) * sc;
+                let sun = mix(mix((1.0, 0.97, 0.85), (1.0, 0.55, 0.15), hot), (0.9, 0.2, 0.05), crit);
+                let g = RadialGradient::new(sx, sy, sr * 0.6, sx, sy, sr * (3.0 + 2.0 * hot));
+                g.add_color_stop_rgba(0.0, sun.0, sun.1, sun.2, 0.55 + 0.3 * hot);
+                g.add_color_stop_rgba(1.0, sun.0, sun.1, sun.2, 0.0);
+                let _ = c.set_source(&g);
+                c.paint_q();
+                rgba(c, sun, 1.0);
+                c.arc(sx, sy, sr, 0.0, 2.0 * PI);
+                c.fill_q();
+            }
+            *self.sky.borrow_mut() = Some(s);
+            *self.sky_key.borrow_mut() = Some(skey);
+        }
+        if let Some(s) = self.sky.borrow().as_ref() {
+            let _ = cr.set_source_surface(s, 0.0, 0.0);
+            cr.paint_q();
+        }
 
         // Tierra.
         if let Some(l) = self.land.borrow().as_ref() {
@@ -505,10 +519,22 @@ pub fn widget(v: Rc<RefCell<Weather>>, pal: Rc<RefCell<Palette>>, font: String) 
     area.set_hexpand(true);
     area.set_vexpand(true);
     let (v2, p2) = (v.clone(), pal.clone());
+    let prof = std::env::var_os("TA_PROF").is_some();
+    let acc: Rc<RefCell<(f64, u32)>> = Rc::new(RefCell::new((0.0, 0)));
     area.set_draw_func(move |_, cr, w, h| {
+        let t0 = std::time::Instant::now();
         let mut x = v2.borrow_mut();
         x.resize(w as f64, h as f64);
         x.draw(cr, &p2.borrow(), &font);
+        if prof {
+            let mut a = acc.borrow_mut();
+            a.0 += t0.elapsed().as_secs_f64() * 1000.0;
+            a.1 += 1;
+            if a.1 == 60 {
+                eprintln!("weather: {:.1} ms/draw", a.0 / 60.0);
+                *a = (0.0, 0);
+            }
+        }
     });
     let last: Rc<RefCell<Option<i64>>> = Rc::new(RefCell::new(None));
     area.add_tick_callback(move |a, clock| {

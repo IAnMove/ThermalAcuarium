@@ -85,6 +85,7 @@ const STR: &[(&str, [&str; 6])] = &[
     ("tab_mem", ["MEMORY", "MEMORIA", "MÉMOIRE", "SPEICHER", "MEMÓRIA", "MEMORIA"]),
     ("mem_cached", ["cache {}", "caché {}", "cache {}", "Cache {}", "cache {}", "cache {}"]),
     ("mem_swap", ["swap {} of {}", "swap {} de {}", "swap {} sur {}", "Swap {} von {}", "swap {} de {}", "swap {} di {}"]),
+    ("mem_fissures", ["fissures in the plain", "grietas de la llanura", "fissures de la plaine", "Risse in der Ebene", "fissuras da planície", "crepe nella pianura"]),
     ("mem_used", ["IN USE", "EN USO", "UTILISÉE", "BELEGT", "EM USO", "IN USO"]),
     ("mem_cache", ["CACHE & BUFFERS", "CACHÉ Y BÚFERES", "CACHE ET TAMPONS", "CACHE & PUFFER", "CACHE E BUFFERS", "CACHE E BUFFER"]),
     ("mem_free", ["AVAILABLE", "DISPONIBLE", "DISPONIBLE", "VERFÜGBAR", "DISPONÍVEL", "DISPONIBILE"]),

@@ -761,7 +761,66 @@ fn snapshot(path: &str) {
     surf.write_to_png(&mut file).expect("no se pudo escribir el PNG");
 }
 
+/// `--bench-scene volcano|rivers|weather`: dibuja 40 fotogramas de esa pestaña a 1180×680 sin ventana
+/// y dice cuánto cuesta cada uno (para optimizar sin adivinar).
+fn bench_scene(which: &str) {
+    let pal = Palette::load();
+    let font = current_font();
+    let (w, h) = (1180, 680);
+    let surf = cairo::ImageSurface::create(cairo::Format::ARgb32, w, h).expect("surface");
+    let cr = cairo::Context::new(&surf).expect("cairo");
+    let mut procs = ProcSampler::new();
+    procs.sample();
+    std::thread::sleep(Duration::from_millis(400));
+    let groups = procs.sample();
+    let mut sys = SysSampler::default();
+    let s = sys.sample();
+    let r = Sensors::new().read();
+    let disks = DiskSampler::default().sample();
+    let mut draw: Box<dyn FnMut(&cairo::Context, f64)> = match which {
+        "volcano" => {
+            let mut v = volcano::Volcano::new();
+            v.resize(w as f64, h as f64);
+            v.set_memory(s.ram_total * 0.8, s.ram_total, s.cached, s.swap_used, s.swap_total);
+            v.set_groups(&groups);
+            Box::new(move |cr, dt| {
+                v.step(dt);
+                v.draw(cr, &pal, &font);
+            })
+        }
+        "rivers" => {
+            let mut v = rivers::Rivers::new();
+            v.resize(w as f64, h as f64);
+            v.set_disks(&disks);
+            v.set_groups(&groups);
+            Box::new(move |cr, dt| {
+                v.step(dt);
+                v.draw(cr, &pal, &font);
+            })
+        }
+        _ => {
+            let mut v = weather::Weather::new(ncpu());
+            v.resize(w as f64, h as f64);
+            v.set_reading(&r, Some(84.0));
+            Box::new(move |cr, dt| {
+                v.step(dt);
+                v.draw(cr, &pal, &font);
+            })
+        }
+    };
+    draw(&cr, 0.0); // hornea las capas estáticas
+    let t0 = std::time::Instant::now();
+    for _ in 0..40 {
+        draw(&cr, 1.0 / 30.0);
+    }
+    eprintln!("{which}: {:.1} ms/fotograma", t0.elapsed().as_secs_f64() * 1000.0 / 40.0);
+}
+
 fn main() -> glib::ExitCode {
+    if let Some(which) = arg_val("--bench-scene") {
+        bench_scene(&which);
+        return glib::ExitCode::SUCCESS;
+    }
     if let Some(p) = arg_val("--snapshot") {
         snapshot(&p);
         return glib::ExitCode::SUCCESS;

@@ -9,7 +9,7 @@ use std::cell::RefCell;
 use std::f64::consts::PI;
 use std::rc::Rc;
 
-use gtk::cairo::{self, Context, ImageSurface, LinearGradient, RadialGradient};
+use gtk::cairo::{self, Context, ImageSurface, LinearGradient};
 use gtk::glib;
 use gtk::prelude::*;
 
@@ -30,6 +30,8 @@ struct Bomb {
 }
 
 struct Puff {
+    kind: usize,
+    rot: f64,
     x: f64,
     y: f64,
     r: f64,
@@ -84,9 +86,13 @@ pub struct Volcano {
     mountain: RefCell<Option<ImageSurface>>,
     section: RefCell<Option<ImageSurface>>,
     lava_tile: RefCell<Option<ImageSurface>>,
+    blobs: Vec<ImageSurface>,
+    /// Cielo con estrellas, horneado por nivel de uso (cambia despacio).
+    sky_key: RefCell<Option<i32>>,
+    sky: RefCell<Option<ImageSurface>>,
 }
 
-const MAX_BOMBS: usize = 600;
+const MAX_BOMBS: usize = 260;
 
 /// Baldosa de lava: costra oscura con grietas incandescentes (ruido fractal mapeado a color).
 fn lava_tile(pal: &Palette) -> ImageSurface {
@@ -148,6 +154,9 @@ impl Volcano {
             mountain: RefCell::new(None),
             section: RefCell::new(None),
             lava_tile: RefCell::new(None),
+            blobs: (0..3).map(|i| noise::blob_tile(96, 1200 + i)).collect(),
+            sky_key: RefCell::new(None),
+            sky: RefCell::new(None),
         }
     }
 
@@ -281,14 +290,16 @@ impl Volcano {
         self.puff_acc += (1.0 + 6.0 * u + 30.0 * erupt) * dt;
         while self.puff_acc >= 1.0 {
             self.puff_acc -= 1.0;
-            if self.puffs.len() > 180 {
+            if self.puffs.len() > 110 {
                 break;
             }
             let max = self.rng.range(4.0, 8.0);
             self.puffs.push(Puff {
+                kind: (self.rng.next() * 3.0) as usize % 3,
+                rot: self.rng.range(0.0, 2.0 * PI),
                 x: px + self.rng.gauss() * self.crater() * 0.4,
                 y: py - 4.0,
-                r: self.crater() * (0.25 + 0.3 * self.rng.next()),
+                r: self.crater() * (0.55 + 0.5 * self.rng.next()),
                 vx: self.rng.gauss() * 6.0 + 12.0,
                 vy: -(16.0 + 30.0 * u + 70.0 * erupt) * self.rng.range(0.7, 1.3),
                 age: 0.0,
@@ -300,7 +311,7 @@ impl Volcano {
             p.x += (p.vx + (self.t * 0.7 + p.y * 0.01).sin() * 8.0) * dt;
             p.y += p.vy * dt;
             p.vy *= 1.0 - 0.25 * dt;
-            p.r += (8.0 + 14.0 * u) * dt;
+            p.r += (14.0 + 20.0 * u) * dt;
         }
         self.puffs.retain(|p| p.age < p.max);
 
@@ -308,7 +319,7 @@ impl Volcano {
         self.ember_acc += (4.0 + 60.0 * act + 150.0 * erupt) * dt;
         while self.ember_acc >= 1.0 {
             self.ember_acc -= 1.0;
-            if self.embers.len() > 400 {
+            if self.embers.len() > 220 {
                 break;
             }
             let from_flow = self.rng.chance(0.5) && !self.flows.is_empty();
@@ -470,15 +481,45 @@ impl Volcano {
             cr.line_to(px, hz + 2.0);
             cr.stroke_q();
         }
+        // Una sola capa estática: el corte encima de la montaña.
+        {
+            let cr = &Context::new(&m).expect("cairo");
+            let _ = cr.set_source_surface(&s, 0.0, 0.0);
+            cr.paint_q();
+        }
         *self.mountain.borrow_mut() = Some(m);
-        *self.section.borrow_mut() = Some(s);
+        *self.section.borrow_mut() = None;
+        *self.sky_key.borrow_mut() = None;
         *self.lava_tile.borrow_mut() = Some(lava_tile(pal));
+    }
+
+    /// Pinta una mancha blanda con el color actual, escalada a (rx, ry), con filtro rápido.
+    fn blob(&self, cr: &Context, k: usize, x: f64, y: f64, rx: f64, ry: f64) {
+        let pat = cairo::SurfacePattern::create(&self.blobs[k]);
+        pat.set_filter(cairo::Filter::Fast);
+        let mut m = cairo::Matrix::identity();
+        m.scale(48.0 / rx.max(1.0), 48.0 / ry.max(1.0));
+        m.translate(-x, -y);
+        m.translate(48.0 * rx.max(1.0) / 48.0 * 0.0, 0.0);
+        // La matriz del patrón va de espacio de usuario a espacio del patrón: el centro del blob
+        // (48, 48) debe caer en (x, y).
+        let mut m2 = cairo::Matrix::identity();
+        m2.translate(48.0, 48.0);
+        m2.scale(48.0 / rx.max(1.0), 48.0 / ry.max(1.0));
+        m2.translate(-x, -y);
+        pat.set_matrix(m2);
+        let _ = m;
+        cr.save_q();
+        cr.rectangle(x - rx, y - ry, 2.0 * rx, 2.0 * ry);
+        cr.clip();
+        let _ = cr.mask(&pat);
+        cr.restore_q();
     }
 
     fn lava_pattern(&self, tile: &ImageSurface, scale: f64, dx: f64, dy: f64) -> cairo::SurfacePattern {
         let pat = cairo::SurfacePattern::create(tile);
         pat.set_extend(cairo::Extend::Repeat);
-        pat.set_filter(cairo::Filter::Bilinear);
+        pat.set_filter(cairo::Filter::Fast);
         let mut m = cairo::Matrix::identity();
         m.scale(1.0 / scale, 1.0 / scale);
         m.translate(-dx, -dy);
@@ -507,33 +548,54 @@ impl Volcano {
 
         cr.save_q();
         cr.translate(self.shake.0, self.shake.1);
+        let prof = std::env::var_os("TA_PROF").is_some();
+        let mut tm = std::time::Instant::now();
+        let mut lap = |name: &str| {
+            if prof {
+                eprintln!("  {name}: {:.2} ms", tm.elapsed().as_secs_f64() * 1000.0);
+            }
+            tm = std::time::Instant::now();
+        };
 
-        // Cielo y estrellas.
-        let sky_top = darken(mix(pal.dbg, (0.02, 0.02, 0.05), 0.5), 0.3);
-        let sky_hz = mix(mix(pal.bg, pal.dbg, 0.3), glow, 0.10 + 0.45 * act + 0.3 * erupt);
-        let _ = cr.set_source(lin(0.0, 0.0, 0.0, hz, &[(0.0, sky_top, 1.0), (1.0, sky_hz, 1.0)]));
-        cr.rectangle(-10.0, -10.0, w + 20.0, h + 20.0);
-        cr.fill_q();
-        for i in 0..90u64 {
-            let (x, y) = (noise::rnd(i as i32, 1, 1) * w, noise::rnd(i as i32, 2, 1) * hz * 0.7);
-            let tw = 0.5 + 0.5 * (self.t * 1.5 + i as f64).sin();
-            rgba(cr, pal.bfg, (0.15 + 0.5 * noise::rnd(i as i32, 3, 1)) * tw * (1.0 - 0.7 * act));
-            cr.rectangle(x.round(), y.round(), 1.5, 1.5);
-            cr.fill_q();
+        lap("sky");
+        // Cielo y estrellas: horneados por nivel de uso (el cielo enrojece con la actividad).
+        let skey = (u * 50.0).round() as i32;
+        if *self.sky_key.borrow() != Some(skey) || self.sky.borrow().is_none() {
+            let s = ImageSurface::create(cairo::Format::ARgb32, (w + 20.0).ceil() as i32, (h + 20.0).ceil() as i32).expect("sky");
+            {
+                let c = &Context::new(&s).expect("cairo");
+                c.translate(10.0, 10.0);
+                let sky_top = darken(mix(pal.dbg, (0.02, 0.02, 0.05), 0.5), 0.3);
+                let sky_hz = mix(mix(pal.bg, pal.dbg, 0.3), glow, 0.10 + 0.45 * act + 0.3 * erupt);
+                let _ = c.set_source(lin(0.0, 0.0, 0.0, hz, &[(0.0, sky_top, 1.0), (1.0, sky_hz, 1.0)]));
+                c.paint_q();
+                for i in 0..90u64 {
+                    let (x, y) = (noise::rnd(i as i32, 1, 1) * w, noise::rnd(i as i32, 2, 1) * hz * 0.7);
+                    rgba(c, pal.bfg, (0.15 + 0.5 * noise::rnd(i as i32, 3, 1)) * (1.0 - 0.7 * act));
+                    c.rectangle(x.round(), y.round(), 1.5, 1.5);
+                    c.fill_q();
+                }
+            }
+            *self.sky.borrow_mut() = Some(s);
+            *self.sky_key.borrow_mut() = Some(skey);
         }
-        let g = RadialGradient::new(px, py, 0.0, px, py, w * (0.18 + 0.35 * act + 0.3 * erupt));
-        g.add_color_stop_rgba(0.0, glow.0, glow.1, glow.2, 0.25 + 0.5 * act);
-        g.add_color_stop_rgba(1.0, glow.0, glow.1, glow.2, 0.0);
-        let _ = cr.set_source(&g);
-        cr.rectangle(-10.0, -10.0, w + 20.0, h + 20.0);
-        cr.fill_q();
+        if let Some(s) = self.sky.borrow().as_ref() {
+            let _ = cr.set_source_surface(s, -10.0, -10.0);
+            cr.paint_q();
+        }
+        // Resplandor del cráter: una mancha blanda escalada (ni círculo ni degradado caro).
+        let glow_r = w * (0.22 + 0.4 * act + 0.3 * erupt) * (0.97 + 0.03 * (self.t * 2.0).sin());
+        rgba(cr, glow, 0.30 + 0.45 * act);
+        self.blob(cr, 0, px, py, glow_r, glow_r);
 
+        lap("stars+glow");
         // Llanura.
         let rock = Self::rock(pal);
         let _ = cr.set_source(lin(0.0, hz, 0.0, h, &[(0.0, mix(rock, pal.bg, 0.3), 1.0), (1.0, darken(pal.dbg, 0.3), 1.0)]));
         cr.rectangle(0.0, hz, w, h - hz);
         cr.fill_q();
 
+        lap("plain");
         // --- Interior del corte: magma dentro de la cámara.
         let ly = self.level_y(u);
         let cy = self.level_y((u + self.cache).min(1.0));
@@ -559,11 +621,12 @@ impl Volcano {
         let _ = cr.set_source(self.lava_pattern(tile, 1.1 * sc, self.t * 6.0, self.t * 14.0));
         cr.rectangle(px, ly, w, hz - ly + 4.0);
         cr.fill_q();
-        cr.set_operator(cairo::Operator::Screen);
         let _ = cr.set_source(self.lava_pattern(tile, 2.3 * sc, -self.t * 4.0, self.t * 9.0));
         cr.rectangle(px, ly, w, hz - ly + 4.0);
-        let _ = cr.paint_with_alpha(0.45 * pulse);
-        cr.set_operator(cairo::Operator::Over);
+        cr.save_q();
+        cr.clip();
+        let _ = cr.paint_with_alpha(0.35 * pulse);
+        cr.restore_q();
         // Convección: burbujas que suben por el magma.
         for i in 0..14u64 {
             let ph = (self.t * (0.25 + 0.2 * noise::rnd(i as i32, 1, 44)) + noise::rnd(i as i32, 2, 44) * 7.0).rem_euclid(1.0);
@@ -588,22 +651,18 @@ impl Volcano {
         cr.fill_q();
         cr.restore_q();
 
+        lap("magma");
         // Capas estáticas.
         if let Some(m) = self.mountain.borrow().as_ref() {
             let _ = cr.set_source_surface(m, 0.0, 0.0);
             cr.paint_q();
         }
-        if let Some(s) = self.section.borrow().as_ref() {
-            let _ = cr.set_source_surface(s, 0.0, 0.0);
-            cr.paint_q();
+        if act > 0.0 || erupt > 0.0 {
+            rgba(cr, glow, 0.35 * act + 0.3 * erupt);
+            self.blob(cr, 1, px, py + 20.0 * sc, w * (0.14 + 0.25 * act), w * (0.10 + 0.18 * act));
         }
-        let g = RadialGradient::new(px, py, 0.0, px, py, w * (0.12 + 0.25 * act));
-        g.add_color_stop_rgba(0.0, glow.0, glow.1, glow.2, 0.35 * act + 0.3 * erupt);
-        g.add_color_stop_rgba(1.0, glow.0, glow.1, glow.2, 0.0);
-        let _ = cr.set_source(&g);
-        cr.rectangle(0.0, py - 10.0, w, hz - py + 10.0);
-        cr.fill_q();
 
+        lap("static+glow");
         // Nieve de la cumbre (exterior): la memoria libre.
         let free = (1.0 - u - self.cache).clamp(0.0, 1.0);
         let snow_h = (hz - py) * 0.4 * free.powf(1.2);
@@ -629,6 +688,7 @@ impl Volcano {
             cr.fill_q();
         }
 
+        lap("snow");
         // Coladas (exterior): los programas que más RAM usan, con textura de lava.
         cr.set_line_cap(cairo::LineCap::Round);
         cr.set_line_join(cairo::LineJoin::Round);
@@ -683,6 +743,7 @@ impl Volcano {
             }
         }
 
+        lap("flows");
         // Rebose: lava que desborda el cráter y baja en sábana por la ladera exterior.
         if over > 0.0 {
             let reach = w * 0.46 * over;
@@ -705,6 +766,7 @@ impl Volcano {
             cr.fill_q();
         }
 
+        lap("overflow");
         // Lago de lava del cráter.
         cr.save_q();
         cr.translate(px, py + 2.0);
@@ -717,52 +779,91 @@ impl Volcano {
         cr.fill_q();
 
         // Bombas, chispas y humo.
-        for b in &self.bombs {
-            let col = Self::lava(pal, 1.0 - b.life);
-            rgba(cr, col, 0.30 * b.life);
-            cr.arc(b.x, b.y, b.r * 2.6, 0.0, 2.0 * PI);
-            cr.fill_q();
-            rgba(cr, col, 0.45 * b.life);
-            cr.set_line_width(b.r * 1.2);
-            cr.move_to(b.x, b.y);
-            cr.line_to(b.x - b.vx * 0.06, b.y - b.vy * 0.06);
+        lap("lake");
+        // Bombas agrupadas en cuatro tonos (pocos rellenos grandes en vez de cientos pequeños).
+        for bucket in 0..4 {
+            let (lo, hi) = (bucket as f64 * 0.25, (bucket + 1) as f64 * 0.25);
+            let life = (lo + hi) / 2.0;
+            let col = Self::lava(pal, 1.0 - life);
+            let sel = || self.bombs.iter().filter(|b| b.life >= lo && b.life < hi);
+            if sel().next().is_none() {
+                continue;
+            }
+            // Estela (desenfoque de movimiento) y brasa; sin discos de halo.
+            rgba(cr, col, 0.5 * life);
+            cr.set_line_width(1.6 * sc);
+            for b in sel() {
+                cr.move_to(b.x, b.y);
+                cr.line_to(b.x - b.vx * 0.08, b.y - b.vy * 0.08);
+            }
             cr.stroke_q();
-            rgba(cr, col, b.life.clamp(0.0, 1.0));
-            cr.arc(b.x, b.y, b.r, 0.0, 2.0 * PI);
+            rgba(cr, lighten(col, 0.2), life.max(0.35));
+            for b in sel() {
+                cr.new_sub_path();
+                cr.arc(b.x, b.y, b.r * 0.7, 0.0, 2.0 * PI);
+            }
             cr.fill_q();
         }
+        rgba(cr, Self::lava(pal, 0.1), 0.85);
         for e in &self.embers {
-            rgba(cr, Self::lava(pal, 0.1), e.life.min(1.0) * 0.9);
             cr.rectangle(e.x.round(), e.y.round(), 2.0 * sc, 2.0 * sc);
-            cr.fill_q();
         }
-        let smoke = mix((0.12, 0.11, 0.12), pal.dfg, 0.2);
+        cr.fill_q();
+        let smoke = mix((0.36, 0.34, 0.34), pal.dfg, 0.25);
+        lap("bombs");
+        // Humo: manchas blandas e irregulares (sin círculos), que nacen incandescentes y se apagan.
         for p in &self.puffs {
             let k = p.age / p.max;
-            let col = mix(Self::lava(pal, 0.6), smoke, (k * 3.0).clamp(0.0, 1.0));
-            rgba(cr, col, (0.45 * (1.0 - k)) * (0.6 + 0.4 * u));
-            cr.arc(p.x, p.y, p.r, 0.0, 2.0 * PI);
-            cr.fill_q();
+            // Nace con un leve rescoldo y enseguida es ceniza gris, grande y transparente.
+            let col = mix(Self::lava(pal, 0.7), smoke, (0.45 + k * 4.0).clamp(0.0, 1.0));
+            rgba(cr, col, (0.5 * (1.0 - k)) * (0.6 + 0.4 * u));
+            let _ = p.rot;
+            self.blob(cr, p.kind, p.x, p.y, p.r, p.r * 0.8);
         }
 
-        // Grietas del swap en la llanura.
-        let ncr = (self.swap * 14.0).round() as usize;
-        for i in 0..ncr {
-            let sd = i as u32 * 31 + 7;
-            let x0 = noise::rnd(i as i32, 1, sd) * w;
-            let y0 = hz + 6.0 + noise::rnd(i as i32, 2, sd) * (h - hz - 12.0);
-            let len = w * (0.04 + 0.12 * noise::rnd(i as i32, 3, sd));
-            for (wd, al) in [(9.0, 0.22 * self.swap + 0.1), (2.2, 0.95)] {
-                rgba(cr, Self::lava(pal, 0.2), al);
-                cr.set_line_width(wd);
-                cr.move_to(x0, y0);
-                for k in 1..=6 {
-                    cr.line_to(x0 + len * k as f64 / 6.0, y0 + (noise::rnd(k, i as i32, sd) - 0.5) * 10.0);
+        lap("smoke");
+        // Swap: la llanura se agrieta y por las fisuras asoma el magma. Cuantas más y más largas,
+        // más swap en uso.
+        let ncr = (self.swap * 9.0).ceil() as usize;
+        if self.swap_total > 0.0 && ncr > 0 {
+            cr.set_line_cap(cairo::LineCap::Round);
+            cr.set_line_join(cairo::LineJoin::Round);
+            for i in 0..ncr {
+                let sd = i as u32 * 31 + 7;
+                let x0 = w * (0.08 + 0.84 * noise::rnd(i as i32, 1, sd));
+                let y0 = hz + 10.0 + noise::rnd(i as i32, 2, sd) * (h - hz - 24.0);
+                let len = w * (0.06 + 0.16 * noise::rnd(i as i32, 3, sd)) * (0.5 + 0.5 * self.swap);
+                let pts: Vec<(f64, f64)> = (0..=8).map(|k| (x0 + len * k as f64 / 8.0, y0 + (noise::rnd(k, i as i32, sd) - 0.5) * 12.0)).collect();
+                let path = |cr: &Context| {
+                    cr.move_to(pts[0].0, pts[0].1);
+                    for p in &pts[1..] {
+                        cr.line_to(p.0, p.1);
+                    }
+                };
+                path(cr);
+                rgba(cr, Self::lava(pal, 0.3), 0.18 + 0.2 * self.swap);
+                cr.set_line_width(14.0 * sc);
+                cr.stroke_q();
+                path(cr);
+                rgba(cr, (0.05, 0.03, 0.03), 0.9);
+                cr.set_line_width(5.0 * sc);
+                cr.stroke_q();
+                path(cr);
+                let _ = cr.set_source(self.lava_pattern(tile, 0.6 * sc, self.t * 5.0, 0.0));
+                cr.set_line_width(2.2 * sc);
+                cr.stroke_q();
+                rgba(cr, (0.05, 0.03, 0.03), 0.8);
+                cr.set_line_width(1.5 * sc);
+                for k in [2usize, 5] {
+                    let (bx, by) = pts[k];
+                    cr.move_to(bx, by);
+                    cr.line_to(bx + (noise::rnd(k as i32, 9, sd) - 0.5) * 24.0, by + (noise::rnd(k as i32, 10, sd) - 0.5) * 16.0);
                 }
                 cr.stroke_q();
             }
         }
 
+        lap("swap");
         // --- Escala: 0–100 % a la derecha del corte, con el nivel actual.
         let xs = (px + self.chamber_half(hz) + 26.0 * sc).min(w - 70.0 * sc);
         rgba(cr, pal.fg, 0.7);
@@ -829,6 +930,21 @@ impl Volcano {
             label(cr, py + 8.0 + fs, &format!("{} {}", tr("mem_free"), fmt_bytes((self.total - self.used - self.cached).max(0.0))), pal.fg);
         }
 
+        lap("scale");
+        // Leyenda de las fisuras, abajo a la derecha.
+        if self.swap_total > 0.0 && self.swap > 0.02 {
+            cr.set_font_size(fs);
+            let txt = format!("{} → {}", trf("mem_swap", &[fmt_bytes(self.swap_used), fmt_bytes(self.swap_total)]), tr("mem_fissures"));
+            if let Ok(e) = cr.text_extents(&txt) {
+                let (x, y) = (w - e.width() - 16.0, h - 12.0);
+                rgba(cr, pal.dbg, 0.65);
+                cr.rectangle(x - 6.0, y - fs - 3.0, e.width() + 12.0, fs + 8.0);
+                cr.fill_q();
+                rgba(cr, Self::lava(pal, 0.05), 1.0);
+                cr.move_to(x, y);
+                let _ = cr.show_text(&txt);
+            }
+        }
         // Cifras arriba a la izquierda.
         cr.set_font_size(fs + 2.0);
         let lines = [
@@ -857,10 +973,22 @@ pub fn widget(v: Rc<RefCell<Volcano>>, pal: Rc<RefCell<Palette>>, font: String) 
     area.set_hexpand(true);
     area.set_vexpand(true);
     let (v2, p2) = (v.clone(), pal.clone());
+    let prof = std::env::var_os("TA_PROF").is_some();
+    let acc: Rc<RefCell<(f64, u32)>> = Rc::new(RefCell::new((0.0, 0)));
     area.set_draw_func(move |_, cr, w, h| {
+        let t0 = std::time::Instant::now();
         let mut vol = v2.borrow_mut();
         vol.resize(w as f64, h as f64);
         vol.draw(cr, &p2.borrow(), &font);
+        if prof {
+            let mut a = acc.borrow_mut();
+            a.0 += t0.elapsed().as_secs_f64() * 1000.0;
+            a.1 += 1;
+            if a.1 == 60 {
+                eprintln!("volcano: {:.1} ms/draw", a.0 / 60.0);
+                *a = (0.0, 0);
+            }
+        }
     });
     let last: Rc<RefCell<Option<i64>>> = Rc::new(RefCell::new(None));
     area.add_tick_callback(move |a, clock| {

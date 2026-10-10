@@ -256,6 +256,55 @@ impl Rivers {
         h
     }
 
+
+    /// Lecho del río (orillas, grava y piedras): estático, se hornea con el terreno.
+    fn draw_bed(&self, cr: &Context, i: usize, pal: &Palette, tile: &ImageSurface) {
+        let pts = self.river_pts(i);
+        let n = pts.len();
+        let sc = (self.w / 1000.0).max(0.6);
+        let hw = |k: usize| self.half_at(i, k as f64 / (n - 1) as f64);
+        let left = |k: usize| pts[k].0 - hw(k);
+        let right = |k: usize| pts[k].0 + hw(k);
+        let poly = |cr: &Context, a: &dyn Fn(usize) -> f64, b: &dyn Fn(usize) -> f64| {
+            cr.move_to(a(0), pts[0].1);
+            for k in 1..n {
+                cr.line_to(a(k), pts[k].1);
+            }
+            for k in (0..n).rev() {
+                cr.line_to(b(k), pts[k].1);
+            }
+            cr.close_path();
+        };
+        let pat = cairo::SurfacePattern::create(tile);
+        pat.set_extend(cairo::Extend::Repeat);
+        let mut m = cairo::Matrix::identity();
+        m.scale(1.0 / (0.6 * sc), 1.0 / (0.6 * sc));
+        pat.set_matrix(m);
+        poly(cr, &|k| left(k) - 5.0 * sc, &|k| right(k) + 5.0 * sc);
+        rgba(cr, (0.20, 0.16, 0.11), 0.75);
+        cr.fill_q();
+        let gravel = mix((0.66, 0.60, 0.48), mix(pal.dfg, pal.bg, 0.4), 0.3);
+        poly(cr, &left, &right);
+        rgba(cr, gravel, 1.0);
+        cr.fill_keep();
+        cr.save_q();
+        cr.clip();
+        cr.set_operator(cairo::Operator::SoftLight);
+        let _ = cr.set_source(&pat);
+        cr.paint_q();
+        cr.set_operator(cairo::Operator::Over);
+        for k in 0..60u64 {
+            let kk = ((noise::rnd(k as i32, 1, 300 + i as u32)) * (n - 1) as f64) as usize;
+            let x = left(kk) + (right(kk) - left(kk)) * noise::rnd(k as i32, 2, 300 + i as u32);
+            let y = pts[kk].1;
+            let rr = (1.0 + 2.5 * noise::rnd(k as i32, 3, 300 + i as u32)) * sc * (0.3 + 0.7 * kk as f64 / n as f64);
+            rgba(cr, darken(gravel, 0.45), 0.7);
+            cr.arc(x, y, rr, 0.0, 2.0 * PI);
+            cr.fill_q();
+        }
+        cr.restore_q();
+    }
+
     /// Paisaje estático: cielo, montañas, meseta iluminada, acantilado, cuencas y presas.
     fn bake(&self, pal: &Palette) {
         let (w, h) = (self.w, self.h);
@@ -332,6 +381,10 @@ impl Rivers {
         cr.source().set_filter(cairo::Filter::Bilinear);
         cr.paint_q();
         cr.restore_q();
+        let wtile = noise::grey_tile(256, 12, 3, 515, 1.6);
+        for i in 0..self.lanes() {
+            self.draw_bed(cr, i, pal, &wtile);
+        }
         // Acantilado: pared de roca con estratos y sombra bajo el borde.
         let _ = cr.set_source(lin(0.0, cy, 0.0, bt + 24.0, &[(0.0, lighten(rock, 0.12), 1.0), (0.3, rock, 1.0), (1.0, darken(rock, 0.55), 1.0)]));
         cr.rectangle(0.0, cy, w, bt + 24.0 - cy);
@@ -402,7 +455,7 @@ impl Rivers {
         cr.rectangle(0.0, bb, w, h - bb);
         cr.fill_q();
         *self.terrain.borrow_mut() = Some(surf);
-        *self.water_tile.borrow_mut() = Some(noise::grey_tile(256, 12, 3, 515, 1.6));
+        *self.water_tile.borrow_mut() = Some(wtile);
     }
 
     pub fn draw(&self, cr: &Context, pal: &Palette, font: &str) {
@@ -430,6 +483,7 @@ impl Rivers {
         let water_pat = |scale: f64, dx: f64, dy: f64| {
             let p = cairo::SurfacePattern::create(tile);
             p.set_extend(cairo::Extend::Repeat);
+            p.set_filter(cairo::Filter::Fast);
             let mut m = cairo::Matrix::identity();
             m.scale(1.0 / scale, 1.0 / scale);
             m.translate(-dx, -dy);
@@ -458,31 +512,6 @@ impl Rivers {
                 cr.close_path();
             };
             let shift = -(bed - ww) / 2.0;
-            // Cauce: orillas de tierra húmeda y lecho de grava (lo que queda seco es el espacio libre).
-            poly(cr, &|k| left(k) - 5.0 * sc, &|k| right(k) + 5.0 * sc);
-            rgba(cr, (0.20, 0.16, 0.11), 0.75);
-            cr.fill_q();
-            let gravel = mix((0.66, 0.60, 0.48), mix(pal.dfg, pal.bg, 0.4), 0.3);
-            poly(cr, &left, &right);
-            rgba(cr, gravel, 1.0);
-            cr.fill_keep();
-            cr.save_q();
-            cr.clip();
-            cr.set_operator(cairo::Operator::SoftLight);
-            let _ = cr.set_source(&water_pat(0.6 * sc, 0.0, 0.0));
-            cr.paint_q();
-            cr.set_operator(cairo::Operator::Over);
-            // Piedras en la grava.
-            for k in 0..60u64 {
-                let kk = ((noise::rnd(k as i32, 1, 300 + i as u32)) * (n - 1) as f64) as usize;
-                let x = left(kk) + (right(kk) - left(kk)) * noise::rnd(k as i32, 2, 300 + i as u32);
-                let y = pts[kk].1;
-                let rr = (1.0 + 2.5 * noise::rnd(k as i32, 3, 300 + i as u32)) * sc * (0.3 + 0.7 * kk as f64 / n as f64);
-                rgba(cr, darken(gravel, 0.45), 0.7);
-                cr.arc(x, y, rr, 0.0, 2.0 * PI);
-                cr.fill_q();
-            }
-            cr.restore_q();
             // Agua: desde la orilla izquierda, tan ancha como el porcentaje usado.
             if r.level > 0.01 {
                 poly(cr, &left, &wright);
@@ -493,10 +522,8 @@ impl Rivers {
                 cr.fill_keep();
                 cr.save_q();
                 cr.clip();
-                cr.set_operator(cairo::Operator::Screen);
                 let _ = cr.set_source(&water_pat(0.8 * sc, 0.0, self.t * (25.0 + 160.0 * r.flow)));
-                let _ = cr.paint_with_alpha(0.9);
-                cr.set_operator(cairo::Operator::Over);
+                let _ = cr.paint_with_alpha(0.35);
                 // Estelas de corriente: su velocidad es la actividad del disco.
                 for s_ in 0..4 {
                     let f = 0.15 + 0.7 * s_ as f64 / 3.0;
@@ -618,10 +645,8 @@ impl Rivers {
             // Reflejo de la pared y de la cascada, y ondas.
             let _ = cr.set_source(lin(0.0, lvl, 0.0, lvl + (bb - lvl) * 0.5, &[(0.0, darken(water, 0.3), 0.5), (1.0, darken(water, 0.3), 0.0)]));
             cr.paint_q();
-            cr.set_operator(cairo::Operator::Screen);
             let _ = cr.set_source(&water_pat(2.2 * sc, self.t * 10.0, self.t * 3.0));
-            let _ = cr.paint_with_alpha(0.3);
-            cr.set_operator(cairo::Operator::Over);
+            let _ = cr.paint_with_alpha(0.18);
             for k in 0..7 {
                 let yy = lvl + (bb - lvl) * (0.08 + 0.13 * k as f64);
                 rgba(cr, lighten(water, 0.55), 0.10 + 0.12 * (self.t * 1.5 + k as f64).sin().abs());
@@ -662,10 +687,8 @@ impl Rivers {
             cr.clip();
             let _ = cr.set_source(lin(fx - fw * 0.8, 0.0, fx + fw * 0.8, 0.0, &[(0.0, water, 0.0), (0.25, foam, 0.8), (0.5, lighten(water, 0.4), 0.95), (0.75, foam, 0.8), (1.0, water, 0.0)]));
             cr.paint_q();
-            cr.set_operator(cairo::Operator::Screen);
             let _ = cr.set_source(&water_pat(0.5 * sc, 0.0, self.t * (150.0 + 350.0 * r.fall)));
-            let _ = cr.paint_with_alpha(0.7);
-            cr.set_operator(cairo::Operator::Over);
+            let _ = cr.paint_with_alpha(0.4);
             for k in 0..5 {
                 let xx = fx + (k as f64 - 2.0) * fw * 0.18;
                 rgba(cr, foam, 0.25 + 0.2 * ((self.t * 7.0 + k as f64).sin()).abs());
@@ -755,10 +778,22 @@ pub fn widget(v: Rc<RefCell<Rivers>>, pal: Rc<RefCell<Palette>>, font: String) -
     area.set_hexpand(true);
     area.set_vexpand(true);
     let (v2, p2) = (v.clone(), pal.clone());
+    let prof = std::env::var_os("TA_PROF").is_some();
+    let acc: Rc<RefCell<(f64, u32)>> = Rc::new(RefCell::new((0.0, 0)));
     area.set_draw_func(move |_, cr, w, h| {
+        let t0 = std::time::Instant::now();
         let mut r = v2.borrow_mut();
         r.resize(w as f64, h as f64);
         r.draw(cr, &p2.borrow(), &font);
+        if prof {
+            let mut a = acc.borrow_mut();
+            a.0 += t0.elapsed().as_secs_f64() * 1000.0;
+            a.1 += 1;
+            if a.1 == 60 {
+                eprintln!("rivers: {:.1} ms/draw", a.0 / 60.0);
+                *a = (0.0, 0);
+            }
+        }
     });
     let last: Rc<RefCell<Option<i64>>> = Rc::new(RefCell::new(None));
     area.add_tick_callback(move |a, clock| {

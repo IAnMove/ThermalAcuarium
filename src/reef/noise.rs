@@ -145,3 +145,26 @@ mod tests {
         }
     }
 }
+
+/// Mancha blanda y blanca de forma irregular (para humo, bruma, resplandores): alfa que cae
+/// suavemente del centro al borde, deformada por ruido para que no se vea un círculo.
+pub fn blob_tile(size: i32, seed: u32) -> cairo::ImageSurface {
+    let mut surf = cairo::ImageSurface::create(cairo::Format::ARgb32, size, size).expect("blob");
+    let stride = surf.stride() as usize;
+    {
+        let mut data = surf.data().expect("blob data");
+        let half = size as f64 / 2.0;
+        for y in 0..size as usize {
+            for x in 0..size as usize {
+                let (dx, dy) = ((x as f64 - half) / half, (y as f64 - half) / half);
+                let ang = dy.atan2(dx);
+                let wobble = 0.72 + 0.28 * fbm(ang.cos() * 1.5 + 2.0, ang.sin() * 1.5 + 2.0, 3, seed, 0);
+                let d = (dx * dx + dy * dy).sqrt() / wobble;
+                let a = (1.0 - d).clamp(0.0, 1.0).powf(1.6) * (0.75 + 0.25 * fbm(dx * 3.0 + 5.0, dy * 3.0 + 5.0, 2, seed + 9, 0));
+                let b = (a * 255.0) as u8;
+                put(&mut data, stride, x, y, [b, b, b, b]);
+            }
+        }
+    }
+    surf
+}

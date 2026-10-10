@@ -26,7 +26,7 @@ volcano drawn in cross‑section, like a textbook diagram. The left half is the 
 is cut open and shows the magma chamber, and **the magma level is exactly the RAM in use**, read
 against a 0–100 % scale next to it. Cache & buffers are the crust of cooler magma on top, the free
 memory is the snow cap on the outside (it melts as memory fills), the programs using the most RAM are
-the lava flows running down the slope, and swap cracks the plain open. Past ~90 % the crater erupts
+the lava flows running down the slope, and swap opens glowing fissures in the plain (legend at the bottom right). Past ~90 % the crater erupts
 (bombs, ash, ground shake) and the lava overflows the rim. `THERMALACUARIUM_DEMO_MEM=0.97` previews it.
 
 | 55 % | 97 % |
@@ -166,6 +166,7 @@ THERMALACUARIUM_LANG=es thermalacuarium
 thermalacuarium --snapshot out.png [--style real] [--size 1180x680] [--seconds 8] [--temp 99] [--demo] [--dying 3] [--names 1] [--hover 600,300] [--bench]
 thermalacuarium --snapshot gallery.png --gallery --style real --len 210   # all reef species
 thermalacuarium --snapshot gallery.png --gallery --style pixel --len 300  # all pixel species
+thermalacuarium --bench-scene volcano|rivers|weather                       # ms per frame of a tab, no window
 thermalacuarium --office           # start in the task-manager view
 thermalacuarium --theme nord       # preview another Omarchy theme (or THERMALACUARIUM_THEME=nord)
 thermalacuarium --new-instance     # open another window without activating the running one
