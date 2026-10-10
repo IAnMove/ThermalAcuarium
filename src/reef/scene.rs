@@ -11,7 +11,7 @@ use gtk::cairo::{self, Context, ImageSurface, RadialGradient};
 
 use super::noise;
 use crate::draw::{Quiet, View, closed_smooth, lin, rgba};
-use crate::sim::{BubbleKind, Pick, Tank, hash_str, unit};
+use crate::sim::{BubbleKind, Life, Pick, Tank, hash_str, unit};
 use crate::theme::{Palette, Rgb, darken, lighten, luma, mix, tone};
 
 // ---------------------------------------------------------------- colores del agua
@@ -483,6 +483,24 @@ pub fn draw_tank(cr: &Context, v: &View) {
         if v.hover == Some(Pick::Decor(i)) {
             decor_outline(cr, d, x, base, v);
         }
+    }
+    // Sombras de los peces sobre la arena: anclan la escena.
+    for f in t.fish.iter().filter(|f| f.life == Life::Alive) {
+        let fy = t.floor_y(f.x);
+        let k = (1.0 - (fy - f.y) / (t.h * 0.7)).clamp(0.0, 1.0);
+        if k < 0.05 {
+            continue;
+        }
+        cr.save_q();
+        cr.translate(f.x, fy + 2.0);
+        cr.scale(f.len * 0.45, f.len * 0.09 + 2.0);
+        let g = RadialGradient::new(0.0, 0.0, 0.0, 0.0, 0.0, 1.0);
+        g.add_color_stop_rgba(0.0, 0.0, 0.0, 0.02, 0.32 * k * f.alpha);
+        g.add_color_stop_rgba(1.0, 0.0, 0.0, 0.02, 0.0);
+        let _ = cr.set_source(&g);
+        cr.arc(0.0, 0.0, 1.0, 0.0, 2.0 * PI);
+        cr.restore_q();
+        cr.fill_q();
     }
     for &i in &t.order {
         crate::draw::fish(cr, &t.fish[i], v.pal, v.hover == Some(Pick::Fish(i)), ds, v.style);

@@ -104,6 +104,8 @@ pub struct GpuCache {
     sprites: HashMap<SKey, GpuSprite>,
     bytes: usize,
     rays: Option<gdk::MemoryTexture>,
+    scan: Option<gdk::MemoryTexture>,
+    caustic: Option<gdk::MemoryTexture>,
     sand: Option<(gdk::MemoryTexture, f32)>,
     decor: Vec<DecorTex>,
     decor_stamp: i64,
@@ -228,6 +230,8 @@ pub fn render(widget: &gtk::Widget, snap: &gtk::Snapshot, v: &View, cache: &mut 
         cache.sprites.clear();
         cache.bytes = 0;
         cache.rays = None;
+        cache.scan = None;
+        cache.caustic = None;
         cache.sand = None;
         cache.decor.clear();
         cache.decor_stamp = -1;
@@ -247,6 +251,10 @@ pub fn render(widget: &gtk::Widget, snap: &gtk::Snapshot, v: &View, cache: &mut 
         crate::reef::gpu_scene::render(widget, snap, v, cache, ds);
         return;
     }
+    if v.style == Style::Sonar {
+        sonar_render(widget, snap, v, cache, ds);
+        return;
+    }
 
     let px = v.style == Style::Pixel;
     draw::set_cell(t.scale());
@@ -259,6 +267,9 @@ pub fn render(widget: &gtk::Widget, snap: &gtk::Snapshot, v: &View, cache: &mut 
     if px {
         for (y0, y1, c) in crate::pixel::water_bands(v) {
             snap.append_color(&col(c, 1.0), &rect(0.0, y0, w, y1 - y0 + 0.5));
+        }
+        for (x, y, c) in crate::pixel::dither_cells(v) {
+            snap.append_color(&col(c, 1.0), &rect(x, y, cell, cell));
         }
     } else {
         snap.append_linear_gradient(&full, &pt(0.0, 0.0), &pt(0.0, h), &stops(&[(0.0, top_c, 1.0), (1.0, bot_c, 1.0)]));
@@ -317,6 +328,29 @@ pub fn render(widget: &gtk::Widget, snap: &gtk::Snapshot, v: &View, cache: &mut 
     }
     if let Some((tex, y0)) = &cache.sand {
         snap.append_texture(tex, &graphene::Rect::new(0.0, *y0, w as f32, h as f32 - *y0));
+    }
+    // Cáusticas sobre la arena (estilizado): baldosa repetida que se desplaza, recortada a la arena.
+    if !px {
+        if cache.caustic.is_none() {
+            cache.caustic = texture_of(crate::reef::noise::caustic_tile(256, 31));
+        }
+        if let Some(tile) = &cache.caustic {
+            let y0 = h * 0.905;
+            snap.push_clip(&rect(0.0, y0, w, h - y0));
+            snap.push_opacity(0.13);
+            let (sx, sy) = (3.0, 1.4);
+            let (ox, oy) = ((t.t * 9.0).rem_euclid(256.0 * sx), (t.t * 4.0).rem_euclid(256.0 * sy));
+            snap.save();
+            snap.translate(&pt(-ox - 256.0 * sx, -oy - 256.0 * sy));
+            snap.scale(sx as f32, sy as f32);
+            let child = rect(0.0, 0.0, 256.0, 256.0);
+            snap.push_repeat(&rect(0.0, 0.0, w / sx + 3.0 * 256.0, h / sy + 3.0 * 256.0), Some(&child));
+            snap.append_texture(tile, &child);
+            snap.pop();
+            snap.restore();
+            snap.pop();
+            snap.pop();
+        }
     }
     if b > 0.01 {
         for i in 0..5 {
@@ -409,6 +443,89 @@ pub fn render(widget: &gtk::Widget, snap: &gtk::Snapshot, v: &View, cache: &mut 
     labels(snap, widget, v);
 }
 
+// ---------------------------------------------------------------- sonar
+
+/// Escena del estilo Sonar con nodos GSK: fondo, rejilla, barrido, arena y superficie como tiras
+/// Cairo finas, peces con sus sprites de eco, burbujas como anillos.
+fn sonar_render(widget: &gtk::Widget, snap: &gtk::Snapshot, v: &View, cache: &mut GpuCache, ds: f64) {
+    use crate::sonar;
+    let t = v.tank;
+    let p = v.pal;
+    let (w, h) = (t.w, t.h);
+    let lc = sonar::line_color(p, t.boil);
+    let full = rect(0.0, 0.0, w, h);
+    snap.append_color(&col(p.dbg, 1.0), &full);
+    snap.append_linear_gradient(&full, &pt(0.0, 0.0), &pt(0.0, h), &stops(&[(0.0, lc, 0.0), (1.0, lc, 0.06 + 0.16 * t.boil)]));
+    for (x0, y0, x1, y1, bright) in sonar::grid_lines(t) {
+        let c = col(lc, if bright { 0.16 } else { 0.07 });
+        if (x1 - x0).abs() < 0.5 {
+            snap.append_color(&c, &rect(x0, 0.0, 1.0, h));
+        } else {
+            snap.append_color(&c, &rect(0.0, y0, w, 1.0));
+        }
+        let _ = (y1, x1);
+    }
+    // Líneas de barrido: una textura de 1×3 repetida.
+    if cache.scan.is_none() {
+        cache.scan = bake(1.0, 3.0, 1.0, |cr| {
+            cr.set_source_rgba(0.0, 0.0, 0.0, 0.18);
+            cr.rectangle(0.0, 0.0, 1.0, 1.0);
+            let _ = cr.fill();
+        });
+    }
+    if let Some(tex) = &cache.scan {
+        snap.push_repeat(&full, Some(&rect(0.0, 0.0, 1.0, 3.0)));
+        snap.append_texture(tex, &rect(0.0, 0.0, 1.0, 3.0));
+        snap.pop();
+    }
+    for m in &t.motes {
+        snap.append_color(&col(lc, 0.08 + 0.25 * m.z), &rect(m.x.round(), m.y.round(), 1.0, 1.0));
+    }
+    // Arena: tira Cairo con el perfil y su halo.
+    {
+        let y0 = h * 0.86;
+        let cr = snap.append_cairo(&rect(0.0, y0, w, h - y0));
+        sonar::floor_path(&cr, t);
+        cr.line_to(w, h);
+        cr.line_to(0.0, h);
+        cr.close_path();
+        cr.set_source_rgba(lc.0, lc.1, lc.2, 0.10);
+        let _ = cr.fill();
+        sonar::floor_path(&cr, t);
+        draw::glow_stroke(&cr, lc, 120.0);
+    }
+    decor(snap, cache, v, ds);
+    if let Some(Pick::Fish(hi)) = v.hover
+        && let Some(hf) = t.fish.get(hi)
+    {
+        for f in t.fish.iter().filter(|f| f.kh == hf.kh && f.life == Life::Alive) {
+            let r = f.len * 0.65;
+            ring(snap, &rect(f.x - r, f.y - r, 2.0 * r, 2.0 * r), r as f32, 1.0, &col(lc, 0.5));
+        }
+    }
+    snap.push_opacity(sonar::flicker(t));
+    for &i in &t.order {
+        fish(snap, cache, v, i, ds);
+    }
+    snap.pop();
+    for b in &t.bubbles {
+        match b.kind {
+            BubbleKind::Air if b.r < 2.0 => snap.append_color(&col(lc, 0.5), &rect(b.x.round(), b.y.round(), 1.0, 1.0)),
+            BubbleKind::Air => ring(snap, &rect(b.x - b.r, b.y - b.r, 2.0 * b.r, 2.0 * b.r), b.r as f32, 1.0, &col(lc, 0.55)),
+            BubbleKind::Foam => snap.append_color(&col(lc, 0.5 * (b.life / b.max_life).clamp(0.0, 1.0)), &rect(b.x - b.r, b.y, 2.0 * b.r, 1.0)),
+        }
+    }
+    {
+        let strip = t.surface_y() + 30.0 * t.scale();
+        let cr = snap.append_cairo(&rect(0.0, 0.0, w, strip));
+        draw::surface_path(&cr, t);
+        draw::glow_stroke(&cr, lc, 120.0);
+    }
+    let big = w.max(h) * 0.8;
+    snap.append_radial_gradient(&full, &pt(w / 2.0, h / 2.0), big as f32, big as f32, (w.min(h) * 0.4 / big) as f32, 1.0, &stops(&[(0.0, (0.0, 0.0, 0.0), 0.0), (1.0, (0.0, 0.0, 0.0), 0.45)]));
+    labels(snap, widget, v);
+}
+
 // ---------------------------------------------------------------- decoración
 
 fn decor(snap: &gtk::Snapshot, cache: &mut GpuCache, v: &View, ds: f64) {
@@ -433,7 +550,18 @@ fn decor(snap: &gtk::Snapshot, cache: &mut GpuCache, v: &View, ds: f64) {
                 } else {
                     bake(bw, bh, ds, |cr| {
                         cr.translate(-bx, -by);
-                        draw::decor(cr, v, d, hover);
+                        if v.style == Style::Sonar {
+                            // Silueta apagada: la pieza se usa como máscara de un solo color.
+                            cr.push_group();
+                            draw::decor(cr, v, d, false);
+                            let _ = cr.pop_group_to_source();
+                            let pat = cr.source();
+                            let c = mix(v.pal.dfg, crate::sonar::line_color(v.pal, 0.0), 0.3);
+                            cr.set_source_rgba(c.0, c.1, c.2, 0.55);
+                            let _ = cr.mask(&pat);
+                        } else {
+                            draw::decor(cr, v, d, hover);
+                        }
                     })?
                 };
                 Some(DecorTex { tex, rect: rect(bx, by, bw, bh) })
@@ -599,6 +727,7 @@ pub(crate) fn labels(snap: &gtk::Snapshot, widget: &gtk::Widget, v: &View) {
     for n in &plan.names {
         let l = text(widget, &n.text, v.font, fs);
         let (tw, _) = l.pixel_size();
+        snap.append_color(&col(p.dbg, 0.55), &rect(n.x - tw as f64 / 2.0 - 5.0, n.y - fs - 1.0, tw as f64 + 10.0, fs + 6.0));
         put_text(snap, &l, n.x - tw as f64 / 2.0, n.y, draw::label_color(p));
     }
     if let Some(hid) = &plan.hidden {

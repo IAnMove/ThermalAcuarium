@@ -198,6 +198,7 @@ pub enum Style {
     Cartoon,
     Pixel,
     Realistic,
+    Sonar,
 }
 
 impl Style {
@@ -206,6 +207,7 @@ impl Style {
             "real" | "realistic" | "realista" => Some(Style::Realistic),
             "stylized" | "cartoon" | "estilizado" => Some(Style::Cartoon),
             "pixel" | "pixelart" | "píxel" => Some(Style::Pixel),
+            "sonar" | "radar" | "hud" => Some(Style::Sonar),
             _ => None,
         }
     }
@@ -214,7 +216,8 @@ impl Style {
         match self {
             Style::Cartoon => Style::Pixel,
             Style::Pixel => Style::Realistic,
-            Style::Realistic => Style::Cartoon,
+            Style::Realistic => Style::Sonar,
+            Style::Sonar => Style::Cartoon,
         }
     }
 
@@ -222,6 +225,7 @@ impl Style {
         match self {
             Style::Cartoon => "stylized",
             Style::Pixel => "pixel",
+            Style::Sonar => "sonar",
             Style::Realistic => "real",
         }
     }

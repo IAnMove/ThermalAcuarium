@@ -29,6 +29,8 @@ pub struct View<'a> {
 pub(crate) trait Quiet {
     fn fill_q(&self);
     fn fill_keep(&self);
+    fn stroke_preserve_q(&self);
+    fn paint_q(&self);
     fn stroke_q(&self);
     fn save_q(&self);
     fn restore_q(&self);
@@ -40,6 +42,12 @@ impl Quiet for Context {
     }
     fn fill_keep(&self) {
         let _ = self.fill_preserve();
+    }
+    fn stroke_preserve_q(&self) {
+        let _ = self.stroke_preserve();
+    }
+    fn paint_q(&self) {
+        let _ = self.paint();
     }
     fn stroke_q(&self) {
         let _ = self.stroke();
@@ -80,6 +88,7 @@ pub fn draw_tank(cr: &Context, v: &View) {
     match v.style {
         Style::Realistic => return crate::reef::scene::draw_tank(cr, v),
         Style::Pixel => return crate::pixel::draw_tank(cr, v),
+        Style::Sonar => return crate::sonar::draw_tank(cr, v),
         Style::Cartoon => {}
     }
     let t = v.tank;
@@ -196,6 +205,42 @@ fn sand_color(p: &Palette) -> Rgb {
     mix(p.yellow, p.orange, 0.3)
 }
 
+thread_local! {
+    static CAUSTIC: cairo::ImageSurface = crate::reef::noise::caustic_tile(256, 31);
+}
+
+/// Red de luz que ondula sobre la arena.
+pub(crate) fn sand_caustics(cr: &Context, t: &Tank, col: &Rgb) {
+    CAUSTIC.with(|tile| {
+        cr.save_q();
+        cr.move_to(0.0, t.h);
+        cr.line_to(0.0, t.floor_y(0.0));
+        let mut x = 0.0;
+        while x < t.w + 6.0 {
+            cr.line_to(x, t.floor_y(x));
+            x += 6.0;
+        }
+        cr.line_to(t.w, t.h);
+        cr.close_path();
+        cr.clip();
+        let pat = cairo::SurfacePattern::create(tile);
+        pat.set_extend(cairo::Extend::Repeat);
+        let mut m = cairo::Matrix::identity();
+        m.translate(-t.t * 9.0, -t.t * 4.0);
+        m.scale(1.0 / 3.0, 1.0 / 1.4);
+        pat.set_matrix(m);
+        let _ = cr.set_source(&pat);
+        cr.set_operator(cairo::Operator::Over);
+        cr.push_group();
+        let _ = cr.paint_with_alpha(0.13);
+        let _ = cr.pop_group_to_source();
+        let src = cr.source();
+        rgba(cr, *col, 1.0);
+        let _ = cr.mask(&src);
+        cr.restore_q();
+    });
+}
+
 /// Arena y piedra de aire. Con `dynamic` también el resplandor del hervor (que el renderizador de
 /// GPU pinta aparte, con degradados nativos).
 pub fn floor(cr: &Context, v: &View, dynamic: bool) {
@@ -261,6 +306,11 @@ pub fn floor(cr: &Context, v: &View, dynamic: bool) {
     rgba(cr, lighten(top_c, 0.35), 0.35);
     cr.set_line_width(1.5);
     cr.stroke_q();
+
+    // Luz de cáusticas sobre la arena (solo en el estilo estilizado; el pixel ya la pinta a celdas).
+    if dynamic && v.style == Style::Cartoon {
+        sand_caustics(cr, t, &lighten(top_c, 0.6));
+    }
 
     // Piedra de aire: sus burbujas siguen la escritura a disco.
     let ax = w * 0.92;
@@ -424,32 +474,32 @@ pub(crate) enum TailKind {
     Crescent,
 }
 
-struct FinDef {
-    u0: f64,
-    u1: f64,
-    h: f64,
-    lean: f64,
-    flow: f64,
+pub(crate) struct FinDef {
+    pub u0: f64,
+    pub u1: f64,
+    pub h: f64,
+    pub lean: f64,
+    pub flow: f64,
 }
 
 #[allow(dead_code)]
-struct Species {
-    ratio: f64,
-    tail_frac: f64,
-    tail: TailKind,
-    spread: f64,
-    prof: &'static [(f64, f64)],
-    dorsal: FinDef,
-    anal: FinDef,
-    pect: f64,
-    eye: f64,
+pub(crate) struct Species {
+    pub ratio: f64,
+    pub tail_frac: f64,
+    pub tail: TailKind,
+    pub spread: f64,
+    pub prof: &'static [(f64, f64)],
+    pub dorsal: FinDef,
+    pub anal: FinDef,
+    pub pect: f64,
+    pub eye: f64,
 }
 
 const fn fin(u0: f64, u1: f64, h: f64, lean: f64, flow: f64) -> FinDef {
     FinDef { u0, u1, h, lean, flow }
 }
 
-const SPECIES_DEFS: [Species; 6] = [
+pub(crate) const SPECIES_DEFS: [Species; 6] = [
     // Tropical clásico
     Species {
         ratio: 0.27,
@@ -554,7 +604,7 @@ pub(crate) struct Spine {
 }
 
 impl Spine {
-    fn new(def: &Species, len: f64, phase: f64, amp: f64, n: usize) -> Spine {
+    pub(crate) fn new(def: &Species, len: f64, phase: f64, amp: f64, n: usize) -> Spine {
         Spine::build(def.prof, def.ratio, def.tail_frac, len, phase, amp, n)
     }
 
@@ -593,7 +643,7 @@ impl Spine {
     }
 }
 
-fn trace_body(cr: &Context, sp: &Spine) {
+pub(crate) fn trace_body(cr: &Context, sp: &Spine) {
     for i in 0..=sp.n {
         let (p, nu, h) = (sp.p[i], sp.nu[i], sp.h[i]);
         let q = (p.0 + nu.0 * h, p.1 + nu.1 * h);
@@ -610,8 +660,26 @@ fn trace_body(cr: &Context, sp: &Spine) {
     cr.close_path();
 }
 
+/// Cómo se pintan aletas y cola: relleno (estilizado) o contorno con halo (sonar).
+#[derive(Clone, Copy, PartialEq)]
+pub(crate) enum Paint {
+    Fill,
+    Glow,
+}
+
+/// Contorno luminoso: tres pasadas (halo ancho, medio y núcleo fino) sobre la ruta actual.
+pub(crate) fn glow_stroke(cr: &Context, col: Rgb, len: f64) {
+    let k = (len / 60.0).clamp(0.5, 1.6);
+    for (wd, a, c) in [(6.0 * k, 0.10, col), (2.6 * k, 0.28, col), (1.0, 1.0, lighten(col, 0.45))] {
+        rgba(cr, c, a);
+        cr.set_line_width(wd);
+        cr.stroke_preserve_q();
+    }
+    cr.new_path();
+}
+
 #[allow(clippy::too_many_arguments)]
-fn draw_fin(cr: &Context, sp: &Spine, fd: &FinDef, up: bool, hh: f64, col: Rgb, phase: f64, detail: u8) {
+pub(crate) fn draw_fin(cr: &Context, sp: &Spine, fd: &FinDef, up: bool, hh: f64, col: Rgb, phase: f64, detail: u8, paint: Paint) {
     let m = if detail == 0 { 6 } else { 12 };
     let mut base = [(0.0, 0.0); 13];
     let mut tip = [(0.0, 0.0); 13];
@@ -636,6 +704,10 @@ fn draw_fin(cr: &Context, sp: &Spine, fd: &FinDef, up: bool, hh: f64, col: Rgb, 
         cr.line_to(base[k].0, base[k].1);
     }
     cr.close_path();
+    if paint == Paint::Glow {
+        glow_stroke(cr, col, hh * 4.0);
+        return;
+    }
     rgba(cr, col, 0.80);
     cr.fill_q();
     if detail > 0 {
@@ -651,7 +723,8 @@ fn draw_fin(cr: &Context, sp: &Spine, fd: &FinDef, up: bool, hh: f64, col: Rgb, 
     }
 }
 
-fn draw_tail(cr: &Context, sp: &Spine, def: &Species, len: f64, col: Rgb, phase: f64, amp: f64, detail: u8) {
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn draw_tail(cr: &Context, sp: &Spine, def: &Species, len: f64, col: Rgb, phase: f64, amp: f64, detail: u8, paint: Paint) {
     let n = sp.n;
     let (pe, pp) = (sp.p[n], sp.p[n - 1]);
     let ang = (pe.1 - pp.1).atan2(pe.0 - pp.0);
@@ -706,6 +779,11 @@ fn draw_tail(cr: &Context, sp: &Spine, def: &Species, len: f64, col: Rgb, phase:
         }
     }
     cr.close_path();
+    if paint == Paint::Glow {
+        glow_stroke(cr, col, len);
+        cr.restore_q();
+        return;
+    }
     let end_a = if def.tail == TailKind::Flowing { 0.3 } else { 0.6 };
     let _ = cr.set_source(lin(0.0, 0.0, tl, 0.0, &[(0.0, darken(col, 0.1), 0.95), (1.0, lighten(col, 0.3), end_a)]));
     cr.fill_keep();
@@ -741,7 +819,10 @@ fn paint_fish(cr: &Context, a: &FishArt, pal: &Palette) {
         crate::reef::fish::paint(cr, a, pal);
         return;
     }
-    debug_assert!(a.style == Style::Cartoon);
+    if a.style == Style::Sonar {
+        crate::sonar::paint(cr, a, pal);
+        return;
+    }
     let def = &SPECIES_DEFS[a.look.species];
     let len = a.len;
     let detail: u8 = if len < 32.0 { 0 } else if len < 72.0 { 1 } else { 2 };
@@ -763,9 +844,9 @@ fn paint_fish(cr: &Context, a: &FishArt, pal: &Palette) {
 
     // Cola y aletas dorsal/anal van detrás del cuerpo.
     let fin_col = lighten(mix(c2, c1, 0.25), 0.08);
-    draw_tail(cr, &sp, def, len, fin_col, a.phase, a.amp, detail);
-    draw_fin(cr, &sp, &def.dorsal, true, hh, fin_col, a.phase, detail);
-    draw_fin(cr, &sp, &def.anal, false, hh, fin_col, a.phase, detail);
+    draw_tail(cr, &sp, def, len, fin_col, a.phase, a.amp, detail, Paint::Fill);
+    draw_fin(cr, &sp, &def.dorsal, true, hh, fin_col, a.phase, detail, Paint::Fill);
+    draw_fin(cr, &sp, &def.anal, false, hh, fin_col, a.phase, detail, Paint::Fill);
 
     // Cuerpo: contraluz (lomo oscuro, vientre claro), tono de la cola y brillo del lomo.
     cr.new_path();
@@ -964,7 +1045,11 @@ pub fn sprite_key(f: &Fish, style: Style) -> (SKey, f64) {
             phase: ph as u8,
             amp,
             dying,
-            style: if style == Style::Realistic { 2 } else { 0 },
+            style: match style {
+                Style::Realistic => 2,
+                Style::Sonar => 3,
+                _ => 0,
+            },
         },
         blen,
     )
@@ -1041,6 +1126,7 @@ pub fn render_sprite(f: &Fish, key: &SKey, blen: f64, pal: &Palette, ds: f64) ->
     let style = match key.style {
         2 => Style::Realistic,
         1 => Style::Pixel,
+        3 => Style::Sonar,
         _ => Style::Cartoon,
     };
     let art = FishArt {
@@ -1057,6 +1143,8 @@ pub fn render_sprite(f: &Fish, key: &SKey, blen: f64, pal: &Palette, ds: f64) ->
     }
     let (half_w, half_h) = if key.style == 2 {
         crate::reef::fish::extent(&f.look, blen, art.amp)
+    } else if key.style == 3 {
+        crate::sonar::extent(f.look.species, blen, art.amp)
     } else {
         let def = &SPECIES_DEFS[f.look.species];
         let hh = def.ratio * blen;
@@ -1079,7 +1167,7 @@ pub fn render_sprite(f: &Fish, key: &SKey, blen: f64, pal: &Palette, ds: f64) ->
 pub fn depth_alpha(f: &Fish, style: Style) -> f64 {
     match style {
         Style::Cartoon | Style::Pixel => 1.0,
-        Style::Realistic => {
+        Style::Realistic | Style::Sonar => {
             let t = ((f.len - 16.0) / 74.0).clamp(0.0, 1.0);
             0.62 + 0.38 * t * t * (3.0 - 2.0 * t)
         }
@@ -1103,6 +1191,7 @@ pub fn body_half_height(f: &Fish, style: Style) -> f64 {
     match style {
         Style::Cartoon => SPECIES_DEFS[f.look.species].ratio * f.len,
         Style::Pixel => f.len * 0.32,
+        Style::Sonar => SPECIES_DEFS[f.look.species].ratio * f.len,
         Style::Realistic => crate::reef::species::SPECIES[f.look.real].ratio * f.len,
     }
 }
@@ -1471,6 +1560,10 @@ pub(crate) fn labels(cr: &Context, v: &View) {
     cr.set_font_size(fs);
     for n in &plan.names {
         if let Ok(e) = cr.text_extents(&n.text) {
+            // Píldora translúcida detrás del nombre: legible sobre cualquier pez.
+            rgba(cr, p.dbg, 0.55);
+            cr.rectangle(n.x - e.width() / 2.0 - 5.0, n.y - fs - 1.0, e.width() + 10.0, fs + 6.0);
+            cr.fill_q();
             text_at(cr, &n.text, n.x - e.width() / 2.0, n.y, label_color(p));
         }
     }

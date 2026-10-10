@@ -7,6 +7,7 @@ mod gpu;
 mod i18n;
 mod pixel;
 mod reef;
+mod sonar;
 mod sim;
 mod sys;
 mod theme;
@@ -143,6 +144,7 @@ fn style_name(s: Style) -> &'static str {
     match s {
         Style::Cartoon => tr("style_toon"),
         Style::Pixel => tr("style_pixel"),
+        Style::Sonar => tr("style_sonar"),
         Style::Realistic => tr("style_real"),
     }
 }

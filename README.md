@@ -19,16 +19,20 @@ Built with **Rust** (GTK4 + Libadwaita), themed from the active **Omarchy** them
 
 Fish are procedural (spine‑driven body, tail and fins), not flat sprites.
 
-## Three visual styles
+## Four visual styles
 
 Press **`T`** (or click the style button in the header) to cycle; the choice is remembered
-(`~/.config/thermalacuarium/style`, or start with `--style stylized|pixel|real`).
+(`~/.config/thermalacuarium/style`, or start with `--style stylized|pixel|real|sonar`).
 
 - **Stylized** (default): soft procedural fish painted with your Omarchy theme colors.
 - **Pixel**: pixel art in the spirit of the Omarchy logo. Seven hand‑drawn species (tropical, tetra,
   angelfish, puffer, betta, torpedo, discus) with three tail frames, flat theme colors and a
   one‑pixel ink outline. A process's size is the sprite's integer zoom: a 1 MB process is a 1× fish,
   an 8 GB one is an 8× fish. Bubbles, light shafts and corals share one pixel grid.
+- **Sonar**: the tank as a radar screen. Dark background with a grid and scanlines, every fish a
+  glowing echo (outline with halo, spine and ribs) in one hue of your theme per shoal, protected
+  processes as dim infrastructure, bubbles as rings, the surface and the sand as bright traces. When
+  the CPU boils the whole screen shifts to red and flickers.
 - **Realistic**: a reef aquarium. 15 species with real anatomy and coloring (clownfish, blue and
   yellow tang, royal gramma, chromis, butterflyfish, angelfish, mandarin dragonet, anthias, cardinalfish,
   damselfish, pufferfish, wrasse, lionfish, grouper) with countershading, scales, fin rays and
@@ -37,7 +41,7 @@ Press **`T`** (or click the style button in the header) to cycle; the choice is 
   kelp, sea fans, brain coral and bubble‑tip anemones for the protected processes. Boiling water
   turns amber with glassy bubbles.
 
-All three **read the active Omarchy theme** and follow theme changes live (run `omarchy theme set …`
+All four **read the active Omarchy theme** and follow theme changes live (run `omarchy theme set …`
 and the window and the tank recolor within a second). In the realistic style the water, light shafts,
 reef wall, rocks, sand tint, glass and air take their hue from the theme's blue/cyan, dark themes give a
 night tank and light themes a bright daytime tank, and fish get a faint tint of that water; species keep
@@ -124,8 +128,12 @@ Telemetry code (`/proc`, `/sys/class/hwmon`) and theming come from ThermalWatch.
 
 ## Screenshots
 
-| Boiling water (realistic) | Stylized | Pixel | Reef species |
-| :--- | :--- | :--- | :--- |
-| ![](docs/boiling.png) | ![](docs/stylized.png) | ![](docs/pixel.png) | ![](docs/species.png) |
+| Stylized | Pixel | Sonar |
+| :--- | :--- | :--- |
+| ![](docs/stylized.png) | ![](docs/pixel.png) | ![](docs/sonar.png) |
+
+| Boiling water (realistic) | Reef species |
+| :--- | :--- |
+| ![](docs/boiling.png) | ![](docs/species.png) |
 
 (Rendered with `--snapshot --demo`.)

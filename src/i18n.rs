@@ -60,6 +60,7 @@ const STR: &[(&str, [&str; 6])] = &[
         "Un acquario che è il tuo computer: ogni processo è un pesce",
     ]),
     ("style_real", ["REALISTIC", "REALISTA", "RÉALISTE", "REALISTISCH", "REALISTA", "REALISTICO"]),
+    ("style_sonar", ["SONAR", "SONAR", "SONAR", "SONAR", "SONAR", "SONAR"]),
     ("style_pixel", ["PIXEL", "PÍXEL", "PIXEL", "PIXEL", "PIXEL", "PIXEL"]),
     ("style_toon", ["STYLIZED", "ESTILIZADO", "STYLISÉ", "STILISIERT", "ESTILIZADO", "STILIZZATO"]),
     ("style_tip", ["Switch visual style (T)", "Cambiar de estilo visual (T)", "Changer de style visuel (T)", "Darstellung wechseln (T)", "Mudar o estilo visual (T)", "Cambia stile visivo (T)"]),

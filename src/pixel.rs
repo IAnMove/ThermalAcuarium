@@ -327,6 +327,24 @@ pub fn water_bands(v: &View) -> Vec<(f64, f64, Rgb)> {
         .collect()
 }
 
+/// Celdas de tramado entre franjas del agua: un damero de una fila en cada frontera, con el color
+/// de la franja de abajo, como se hacían los degradados en pixel art.
+pub fn dither_cells(v: &View) -> Vec<(f64, f64, Rgb)> {
+    let c = cell();
+    let w = v.tank.w;
+    let bands = water_bands(v);
+    let mut out = vec![];
+    for i in 1..bands.len() {
+        let y = snap(bands[i].0) - c;
+        let mut x = if i % 2 == 0 { 0.0 } else { c };
+        while x < w {
+            out.push((x, y, bands[i].2));
+            x += 2.0 * c;
+        }
+    }
+    out
+}
+
 /// Pinta `paint` a una celda por píxel y lo amplía sin suavizado.
 pub fn pixelated(cr: &Context, x: f64, y: f64, w: f64, h: f64, paint: impl FnOnce(&Context)) {
     let c = cell();
@@ -415,9 +433,14 @@ pub fn draw_tank(cr: &Context, v: &View) {
         cr.rectangle(0.0, y0, w, y1 - y0 + 0.5);
         cr.fill_q();
     }
+    let c = cell();
+    for (x, y, col) in dither_cells(v) {
+        rgba(cr, col, 1.0);
+        cr.rectangle(x, y, c, c);
+        cr.fill_q();
+    }
     pixelated(cr, 0.0, 0.0, w, h, |c| rays(c, v, t.t, t.boil));
     let (top, _) = water_colors(v);
-    let c = cell();
     for m in &t.motes {
         rgba(cr, lighten(top, 0.7), 0.10 + 0.22 * m.z);
         cr.rectangle(snap(m.x), snap(m.y), c, c);
@@ -471,10 +494,10 @@ pub fn gallery(cr: &Context, w: f64, h: f64, len: f64, font: &str, pal: &Palette
         for (j, frame) in [0usize, 1, 2].iter().enumerate() {
             let mut lk = look;
             lk.seed = (0..1000).find(|&s| species_of(&Look { seed: s, ..look }) == i).unwrap_or(0);
-            let k = scale_of(&lk, len / 3.0);
+            let k = scale_of(&lk, len / 3.4);
             let spr = render(&lk, *frame, k, pal, false);
             cr.save_q();
-            cr.translate(cx + (j as f64 - 1.0) * len * 0.36, cy);
+            cr.translate(cx + (j as f64 - 1.0) * len * 0.46, cy);
             cr.scale(k, k);
             let _ = cr.set_source_surface(&spr.surf, -spr.ox / k, -spr.oy / k);
             cr.source().set_filter(cairo::Filter::Nearest);

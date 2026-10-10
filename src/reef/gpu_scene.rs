@@ -173,7 +173,24 @@ pub fn render(widget: &gtk::Widget, snap: &gtk::Snapshot, v: &View, cache: &mut 
             }
         }
 
-    // 6. Peces y burbujas.
+    // 6. Sombras sobre la arena, peces y burbujas.
+    for f in t.fish.iter().filter(|f| f.life == crate::sim::Life::Alive) {
+        let fy = t.floor_y(f.x);
+        let k = (1.0 - (fy - f.y) / (h * 0.7)).clamp(0.0, 1.0);
+        if k < 0.05 {
+            continue;
+        }
+        let (rx, ry) = (f.len * 0.45, f.len * 0.09 + 2.0);
+        snap.append_radial_gradient(
+            &rect(f.x - rx, fy + 2.0 - ry, 2.0 * rx, 2.0 * ry),
+            &pt(f.x, fy + 2.0),
+            rx as f32,
+            ry as f32,
+            0.0,
+            1.0,
+            &stops(&[(0.0, (0.0, 0.0, 0.02), 0.32 * k * f.alpha), (1.0, (0.0, 0.0, 0.02), 0.0)]),
+        );
+    }
     for &i in &t.order {
         crate::gpu::fish(snap, cache, v, i, ds);
     }
