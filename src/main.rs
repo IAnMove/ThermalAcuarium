@@ -1,0 +1,568 @@
+//! ThermalAcuarium - una pecera que es tu ordenador: cada proceso real es un pez.
+//! RAM → tamaño · CPU → velocidad · escritura a disco → burbujas · temperatura → el agua hierve.
+//! Ventana normal de Hyprland con la estética de Omarchy (paleta y fuente del tema activo).
+
+mod draw;
+mod gpu;
+mod i18n;
+mod reef;
+mod sim;
+mod sys;
+mod theme;
+
+use std::cell::RefCell;
+use std::rc::Rc;
+use std::time::Duration;
+
+use adw::prelude::*;
+use gtk::cairo;
+use gtk::{gdk, gio, glib};
+
+use draw::View;
+use i18n::{tr, trf};
+use sim::{Pick, Tank};
+use sys::{ProcSampler, Sensors, SysSampler, comm_of, fmt_bytes};
+use theme::{Palette, Rgb, Style, current_font, to_hex};
+
+const APP_ID: &str = "dev.ina.thermalacuarium";
+
+// ---------------------------------------------------------------- argumentos
+
+fn arg_val(name: &str) -> Option<String> {
+    let a: Vec<String> = std::env::args().collect();
+    a.iter().position(|x| x == name).and_then(|i| a.get(i + 1).cloned())
+}
+
+fn has_flag(name: &str) -> bool {
+    std::env::args().any(|a| a == name)
+}
+
+/// Temperatura forzada (`--temp 95` o THERMALACUARIUM_DEMO) para ver hervir el agua sin calentar el equipo.
+fn demo_temp() -> Option<f64> {
+    arg_val("--temp").or_else(|| std::env::var("THERMALACUARIUM_DEMO").ok()).and_then(|s| s.parse().ok())
+}
+
+/// Estilo inicial: `--style real|stylized` o el último que se eligió.
+fn start_style() -> Style {
+    arg_val("--style").and_then(|s| Style::parse(&s)).unwrap_or_else(Style::load)
+}
+
+fn seed() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0x9E3779B97F4A7C15, |d| d.as_nanos() as u64 | 1)
+}
+
+fn ncpu() -> f64 {
+    std::thread::available_parallelism().map_or(1.0, |n| n.get() as f64)
+}
+
+// ---------------------------------------------------------------- estado
+
+struct Model {
+    tank: Tank,
+    pal: Palette,
+    font: String,
+    sensors: Sensors,
+    sys: SysSampler,
+    procs: ProcSampler,
+    hover: Option<Pick>,
+    cursor: Option<(f64, f64)>,
+    names: u8,
+    paused: bool,
+    last_frame: Option<i64>,
+    first_sync: bool,
+    gpu: gpu::GpuCache,
+    style: Style,
+}
+
+struct Chips {
+    temp: gtk::Label,
+    cpu: gtk::Label,
+    ram: gtk::Label,
+    disk: gtk::Label,
+    fish: gtk::Label,
+}
+
+struct Ui {
+    m: Rc<RefCell<Model>>,
+    win: adw::ApplicationWindow,
+    area: gpu::TankWidget,
+    toasts: adw::ToastOverlay,
+    provider: gtk::CssProvider,
+    chips: Chips,
+    style_btn: gtk::Button,
+}
+
+fn chip(pal: &Palette, key: &str, val: &str, vcol: Option<Rgb>) -> String {
+    format!(
+        "<span foreground=\"{}\" size=\"small\" weight=\"bold\">{}</span>  <span foreground=\"{}\" weight=\"bold\">{}</span>",
+        to_hex(pal.dfg),
+        glib::markup_escape_text(key),
+        to_hex(vcol.unwrap_or(pal.bfg)),
+        glib::markup_escape_text(val)
+    )
+}
+
+// ---------------------------------------------------------------- muestreo
+
+fn update_sensors(ui: &Rc<Ui>) {
+    let mut guard = ui.m.borrow_mut();
+    let m = &mut *guard;
+    let r = m.sensors.read();
+    let s = m.sys.sample();
+    let temp = demo_temp().or(r.cpu);
+    m.tank.set_env(temp, r.load / ncpu(), s.ram_used, s.ram_total, s.disk_w);
+
+    let pal = &m.pal;
+    let f = |v: Option<f64>| v.map_or("--".to_string(), |v| format!("{v:.0}°"));
+    ui.chips.temp.set_markup(&chip(pal, "󰔏", &f(temp), temp.map(|t| pal.heat(t))));
+    ui.chips.temp.set_tooltip_text(Some(&trf("sensors_tip", &[f(r.gpu), f(r.nvme)])));
+    ui.chips.cpu.set_markup(&chip(pal, "CPU", &format!("{:.0}%", s.cpu_pct), None));
+    ui.chips.ram.set_markup(&chip(
+        pal,
+        "RAM",
+        &trf("ram_of", &[format!("{:.0}", s.ram_used / s.ram_total.max(1.0) * 100.0), fmt_bytes(s.ram_total)]),
+        None,
+    ));
+    ui.chips.disk.set_markup(&chip(pal, tr("chip_disk"), &format!("{}/s", fmt_bytes(s.disk_w)), None));
+    let n = m.tank.fish.iter().filter(|f| f.life == sim::Life::Alive).count();
+    ui.chips.fish.set_markup(&chip(pal, "🐟", &trf("fish_n", &[n.to_string()]).replace("🐟", ""), None));
+}
+
+fn sample_procs(ui: &Rc<Ui>) {
+    let mut m = ui.m.borrow_mut();
+    let groups = m.procs.sample();
+    let first = m.first_sync;
+    m.first_sync = false;
+    m.tank.sync(&groups, first);
+}
+
+fn style_name(s: Style) -> &'static str {
+    match s {
+        Style::Cartoon => tr("style_toon"),
+        Style::Realistic => tr("style_real"),
+    }
+}
+
+/// Cambia entre el estilo estilizado y el realista y recuerda la elección.
+fn toggle_style(ui: &Rc<Ui>) {
+    let s = {
+        let mut m = ui.m.borrow_mut();
+        m.style = m.style.toggled();
+        m.style.save();
+        m.style
+    };
+    ui.style_btn.set_label(style_name(s));
+    ui.toasts.add_toast(adw::Toast::new(&trf("style_toast", &[style_name(s).to_string()])));
+    ui.area.queue_draw();
+}
+
+const X_URL: &str = "https://x.com/theinaog";
+
+/// Diálogo "Acerca de" con el enlace a la cuenta de X del autor.
+fn show_about(ui: &Rc<Ui>) {
+    let d = adw::AboutDialog::builder()
+        .application_name("ThermalAcuarium")
+        .application_icon("utilities-system-monitor")
+        .developer_name("@theinaog")
+        .version(env!("CARGO_PKG_VERSION"))
+        .comments(tr("about_comments"))
+        .build();
+    d.add_link("X · @theinaog", X_URL);
+    d.set_developers(&[&format!("@theinaog {X_URL}")]);
+    d.present(Some(&ui.win));
+}
+
+fn apply_theme(ui: &Rc<Ui>, force: bool) {
+    let new = Palette::load();
+    {
+        let m = ui.m.borrow();
+        if !force && m.pal.raw == new.raw {
+            return;
+        }
+        #[allow(deprecated)]
+        ui.provider.load_from_data(&new.css(&m.font));
+    }
+    adw::StyleManager::default().set_color_scheme(if new.dark {
+        adw::ColorScheme::ForceDark
+    } else {
+        adw::ColorScheme::ForceLight
+    });
+    ui.m.borrow_mut().pal = new;
+    ui.area.queue_draw();
+}
+
+// ---------------------------------------------------------------- interacción
+
+fn refresh_hover(ui: &Rc<Ui>) {
+    let (changed, over_fish) = {
+        let mut m = ui.m.borrow_mut();
+        let pick = m.cursor.and_then(|(x, y)| m.tank.pick(x, y));
+        let changed = pick != m.hover;
+        m.hover = pick;
+        (changed, matches!(pick, Some(Pick::Fish(_))))
+    };
+    if changed {
+        ui.area.set_cursor_from_name(Some(if over_fish { "pointer" } else { "default" }));
+        ui.area.queue_draw();
+    }
+}
+
+fn on_click(ui: &Rc<Ui>, x: f64, y: f64) {
+    let pick = ui.m.borrow().tank.pick(x, y);
+    match pick {
+        Some(Pick::Fish(i)) => confirm_kill(ui, i),
+        Some(Pick::Decor(i)) => {
+            let name = ui.m.borrow().tank.decor.get(i).map(|d| d.key.clone());
+            if let Some(n) = name {
+                ui.toasts.add_toast(adw::Toast::new(&trf("protected_msg", &[n])));
+            }
+        }
+        None => {}
+    }
+}
+
+fn confirm_kill(ui: &Rc<Ui>, i: usize) {
+    let (key, pid, cpu, mem, group) = {
+        let m = ui.m.borrow();
+        let Some(f) = m.tank.fish.get(i) else { return };
+        (f.key.clone(), f.pid, f.cpu, f.mem, m.tank.pids_of(f.kh))
+    };
+    let body = trf("kill_body", &[key.clone(), pid.to_string(), format!("{cpu:.0}"), fmt_bytes(mem)]);
+    let d = adw::AlertDialog::new(Some(tr("kill_head")), Some(&body));
+    d.add_response("cancel", tr("cancel"));
+    if group.len() > 1 {
+        d.add_response("one", tr("kill_one"));
+        d.add_response("all", &trf("kill_all", &[group.len().to_string()]));
+        d.set_response_appearance("all", adw::ResponseAppearance::Destructive);
+    } else {
+        d.add_response("one", tr("kill_proc"));
+    }
+    d.set_response_appearance("one", adw::ResponseAppearance::Destructive);
+    d.set_default_response(Some("cancel"));
+    d.set_close_response("cancel");
+    let ui2 = ui.clone();
+    d.choose(Some(&ui.win), gio::Cancellable::NONE, move |resp| match resp.as_str() {
+        "one" => kill_pids(&ui2, vec![pid], key),
+        "all" => kill_pids(&ui2, group, key),
+        _ => {}
+    });
+}
+
+/// SIGTERM ya y, si a los 3 s sigue siendo el mismo proceso, SIGKILL. El pez se pone panza arriba.
+fn kill_pids(ui: &Rc<Ui>, pids: Vec<i32>, key: String) {
+    let mut targets = vec![];
+    for &p in &pids {
+        if p > 1
+            && let Some(c) = comm_of(p) {
+                targets.push((p, c));
+                unsafe { libc::kill(p, libc::SIGTERM) };
+            }
+    }
+    ui.m.borrow_mut().tank.mark_dying(&pids);
+    ui.toasts.add_toast(adw::Toast::new(&trf("closing", &[key])));
+
+    let u = ui.clone();
+    glib::timeout_add_local_once(Duration::from_millis(800), move || sample_procs(&u));
+    let u = ui.clone();
+    glib::timeout_add_local_once(Duration::from_secs(3), move || {
+        for (p, c) in &targets {
+            if comm_of(*p).as_ref() == Some(c) {
+                unsafe { libc::kill(*p, libc::SIGKILL) };
+            }
+        }
+        let u2 = u.clone();
+        glib::timeout_add_local_once(Duration::from_millis(600), move || sample_procs(&u2));
+    });
+}
+
+// ---------------------------------------------------------------- ventana
+
+fn build_ui(app: &adw::Application) {
+    if let Some(w) = app.active_window() {
+        w.present();
+        return;
+    }
+    let provider = gtk::CssProvider::new();
+    gtk::style_context_add_provider_for_display(
+        &gdk::Display::default().expect("sin display"),
+        &provider,
+        gtk::STYLE_PROVIDER_PRIORITY_APPLICATION,
+    );
+
+    let m = Rc::new(RefCell::new(Model {
+        tank: Tank::new(1180.0, 680.0, seed()),
+        pal: Palette::load(),
+        font: current_font(),
+        sensors: Sensors::new(),
+        sys: SysSampler::default(),
+        procs: ProcSampler::new(),
+        hover: None,
+        cursor: None,
+        names: 0,
+        paused: false,
+        last_frame: None,
+        first_sync: true,
+        gpu: gpu::GpuCache::default(),
+        style: start_style(),
+    }));
+
+    let win = adw::ApplicationWindow::builder()
+        .application(app)
+        .title("ThermalAcuarium")
+        .default_width(1180)
+        .default_height(720)
+        .build();
+    win.add_css_class("ta");
+
+    let area = gpu::TankWidget::new();
+    area.set_hexpand(true);
+    area.set_vexpand(true);
+    let toasts = adw::ToastOverlay::new();
+    toasts.set_child(Some(&area));
+
+    let mk = || {
+        let l = gtk::Label::new(None);
+        l.add_css_class("chip");
+        l
+    };
+    let chips = Chips { temp: mk(), cpu: mk(), ram: mk(), disk: mk(), fish: mk() };
+    let chip_box = gtk::Box::new(gtk::Orientation::Horizontal, 0);
+    for l in [&chips.temp, &chips.cpu, &chips.ram, &chips.disk, &chips.fish] {
+        chip_box.append(l);
+    }
+    let title = gtk::Label::new(Some("THERMALACUARIUM"));
+    title.add_css_class("title");
+    let header = adw::HeaderBar::new();
+    header.pack_start(&title);
+    header.set_title_widget(Some(&chip_box));
+    let style_btn = gtk::Button::with_label(style_name(m.borrow().style));
+    style_btn.add_css_class("flat");
+    style_btn.add_css_class("stylebtn");
+    style_btn.set_tooltip_text(Some(tr("style_tip")));
+    let about_btn = gtk::Button::from_icon_name("help-about-symbolic");
+    about_btn.add_css_class("flat");
+    about_btn.set_tooltip_text(Some(tr("about")));
+    header.pack_end(&about_btn);
+    header.pack_end(&style_btn);
+    let tv = adw::ToolbarView::new();
+    tv.add_top_bar(&header);
+    tv.set_content(Some(&toasts));
+    win.set_content(Some(&tv));
+
+    let ui = Rc::new(Ui { m: m.clone(), win: win.clone(), area: area.clone(), toasts, provider, chips, style_btn: style_btn.clone() });
+    let u = ui.clone();
+    style_btn.connect_clicked(move |_| toggle_style(&u));
+    let u = ui.clone();
+    about_btn.connect_clicked(move |_| show_about(&u));
+
+    // Dibujo: el árbol de nodos GSK de cada fotograma (la GPU compone, ver gpu.rs).
+    let md = m.clone();
+    area.set_render(move |w, snap| {
+        let mut guard = md.borrow_mut();
+        let m = &mut *guard;
+        m.tank.resize(WidgetExt::width(w) as f64, WidgetExt::height(w) as f64);
+        let v = View { tank: &m.tank, pal: &m.pal, font: &m.font, hover: m.hover, names: m.names, paused: m.paused, style: m.style };
+        gpu::render(w.upcast_ref(), snap, &v, &mut m.gpu);
+    });
+
+    // Reloj de animación: sincronizado con el frame clock y limitado a ~30 FPS para no gastar CPU.
+    let u = ui.clone();
+    area.add_tick_callback(move |_, clock| {
+        let now = clock.frame_time();
+        {
+            let mut m = u.m.borrow_mut();
+            if m.paused {
+                m.last_frame = None;
+                return glib::ControlFlow::Continue;
+            }
+            let dt = m.last_frame.map_or(0.0, |l| (now - l) as f64 / 1e6);
+            if m.last_frame.is_some() && dt < 1.0 / 31.0 {
+                return glib::ControlFlow::Continue;
+            }
+            m.last_frame = Some(now);
+            m.tank.step(dt);
+        }
+        refresh_hover(&u);
+        u.area.queue_draw();
+        glib::ControlFlow::Continue
+    });
+
+    let motion = gtk::EventControllerMotion::new();
+    let u = ui.clone();
+    motion.connect_motion(move |_, x, y| {
+        u.m.borrow_mut().cursor = Some((x, y));
+        refresh_hover(&u);
+    });
+    let u = ui.clone();
+    motion.connect_leave(move |_| {
+        u.m.borrow_mut().cursor = None;
+        refresh_hover(&u);
+    });
+    area.add_controller(motion);
+
+    let click = gtk::GestureClick::new();
+    click.set_button(1);
+    let u = ui.clone();
+    click.connect_pressed(move |_, _, x, y| on_click(&u, x, y));
+    area.add_controller(click);
+
+    // L: nombres · Espacio: pausa
+    let keys = gtk::EventControllerKey::new();
+    let u = ui.clone();
+    keys.connect_key_pressed(move |_, key, _, _| {
+        match key {
+            gdk::Key::l | gdk::Key::L => {
+                let mut m = u.m.borrow_mut();
+                m.names = (m.names + 1) % 3;
+            }
+            gdk::Key::t | gdk::Key::T => toggle_style(&u),
+            gdk::Key::space => {
+                let mut m = u.m.borrow_mut();
+                m.paused = !m.paused;
+            }
+            _ => return glib::Propagation::Proceed,
+        }
+        u.area.queue_draw();
+        glib::Propagation::Stop
+    });
+    win.add_controller(keys);
+
+    apply_theme(&ui, true);
+    update_sensors(&ui);
+    // La primera muestra solo sirve de referencia para medir CPU; la buena llega enseguida.
+    ui.m.borrow_mut().procs.sample();
+    let u = ui.clone();
+    glib::timeout_add_local_once(Duration::from_millis(700), move || {
+        sample_procs(&u);
+        update_sensors(&u);
+    });
+    let u = ui.clone();
+    glib::timeout_add_seconds_local(1, move || {
+        update_sensors(&u);
+        glib::ControlFlow::Continue
+    });
+    let u = ui.clone();
+    glib::timeout_add_seconds_local(2, move || {
+        sample_procs(&u);
+        glib::ControlFlow::Continue
+    });
+    let u = ui.clone();
+    glib::timeout_add_seconds_local(6, move || {
+        apply_theme(&u, false);
+        glib::ControlFlow::Continue
+    });
+
+    win.present();
+}
+
+// ---------------------------------------------------------------- captura sin ventana
+
+/// `--snapshot out.png [--size 1180x680] [--seconds 8] [--temp 95] [--demo] [--dying N] [--hover x,y] [--names 0|1|2]`
+/// Renderiza la pecera real a un PNG sin abrir ventana: sirve para probar el aspecto.
+fn snapshot(path: &str) {
+    let (w, h) = arg_val("--size")
+        .and_then(|s| {
+            let (a, b) = s.split_once('x')?;
+            Some((a.parse::<i32>().ok()?, b.parse::<i32>().ok()?))
+        })
+        .unwrap_or((1180, 680));
+    let secs: f64 = arg_val("--seconds").and_then(|s| s.parse().ok()).unwrap_or(8.0);
+    let pal = Palette::load();
+    let font = current_font();
+    let style = start_style();
+    if has_flag("--gallery") {
+        let surf = cairo::ImageSurface::create(cairo::Format::ARgb32, w, h).expect("surface");
+        {
+            let cr = cairo::Context::new(&surf).expect("cairo");
+            let len: f64 = arg_val("--len").and_then(|s| s.parse().ok()).unwrap_or(150.0);
+            reef::scene::gallery(&cr, w as f64, h as f64, len, &font, &pal);
+        }
+        let mut file = std::fs::File::create(path).expect("no se pudo crear el PNG");
+        surf.write_to_png(&mut file).expect("no se pudo escribir el PNG");
+        return;
+    }
+    let mut tank = Tank::new(w as f64, h as f64, 0xC0FFEE);
+    let sensors = Sensors::new();
+    let mut sys = SysSampler::default();
+    let mut procs = ProcSampler::new();
+    procs.sample();
+    sys.sample();
+    std::thread::sleep(Duration::from_millis(600));
+    let s = sys.sample();
+    let r = sensors.read();
+    tank.set_env(demo_temp().or(r.cpu), r.load / ncpu(), s.ram_used, s.ram_total, s.disk_w);
+    tank.sync(&procs.sample(), true);
+    if has_flag("--demo") {
+        tank.demo_randomize();
+    }
+    if let Some(n) = arg_val("--dying").and_then(|s| s.parse::<usize>().ok()) {
+        // Solo visual: marca los n peces más grandes como cerrados, sin tocar ningún proceso.
+        let mut by_size: Vec<(f64, i32)> = tank.fish.iter().map(|f| (f.len, f.pid)).collect();
+        by_size.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal));
+        tank.mark_dying(&by_size.iter().take(n).map(|x| x.1).collect::<Vec<_>>());
+    }
+    for _ in 0..(secs * 30.0) as usize {
+        tank.step(1.0 / 30.0);
+    }
+    let hover = arg_val("--hover").and_then(|s| {
+        let (a, b) = s.split_once(',')?;
+        tank.pick(a.parse().ok()?, b.parse().ok()?)
+    });
+    let names = arg_val("--names").and_then(|s| s.parse().ok()).unwrap_or(0);
+
+    let surf = cairo::ImageSurface::create(cairo::Format::ARgb32, w, h).expect("surface");
+    let cr = cairo::Context::new(&surf).expect("cairo");
+    let view = View { tank: &tank, pal: &pal, font: &font, hover, names, paused: false, style };
+    if has_flag("--bench") {
+        // Fotograma a fotograma como en la app (paso + dibujo), para ver el coste de calentar la caché.
+        let mut times = vec![];
+        let mut bench = Tank::new(w as f64, h as f64, 0xC0FFEE);
+        bench.set_env(demo_temp().or(r.cpu), r.load / ncpu(), s.ram_used, s.ram_total, s.disk_w);
+        bench.sync(&procs.sample(), true);
+        bench.demo_randomize();
+        for _ in 0..180 {
+            bench.step(1.0 / 30.0);
+            let v = View { tank: &bench, pal: &pal, font: &font, hover: None, names: 0, paused: false, style };
+            let t = std::time::Instant::now();
+            draw::draw_tank(&cr, &v);
+            times.push(t.elapsed().as_secs_f64() * 1000.0);
+        }
+        let avg = |r: &[f64]| r.iter().sum::<f64>() / r.len() as f64;
+        eprintln!(
+            "bench: primeros 30 fotogramas {:.1} ms · últimos 90 {:.1} ms · máx {:.1} ms",
+            avg(&times[..30]),
+            avg(&times[90..]),
+            times.iter().cloned().fold(0.0, f64::max)
+        );
+    }
+    let t0 = std::time::Instant::now();
+    let reps = 20;
+    for _ in 0..reps {
+        draw::draw_tank(&cr, &view);
+    }
+    eprintln!(
+        "{} peces · {} burbujas · hervor {:.2} · {:.1} ms/fotograma",
+        tank.fish.len(),
+        tank.bubbles.len(),
+        tank.boil,
+        t0.elapsed().as_secs_f64() * 1000.0 / reps as f64
+    );
+    drop(cr);
+    let mut file = std::fs::File::create(path).expect("no se pudo crear el PNG");
+    surf.write_to_png(&mut file).expect("no se pudo escribir el PNG");
+}
+
+fn main() -> glib::ExitCode {
+    if let Some(p) = arg_val("--snapshot") {
+        snapshot(&p);
+        return glib::ExitCode::SUCCESS;
+    }
+    // `--new-instance`: no registrarse en el bus, para poder abrir otra ventana (o probar) sin
+    // activar la que ya esté abierta.
+    let flags = if has_flag("--new-instance") { gio::ApplicationFlags::NON_UNIQUE } else { gio::ApplicationFlags::default() };
+    let app = adw::Application::builder().application_id(APP_ID).flags(flags).build();
+    app.connect_activate(build_ui);
+    app.run_with_args::<String>(&[])
+}

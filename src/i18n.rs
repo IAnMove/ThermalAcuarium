@@ -1,0 +1,130 @@
+//! Idioma del sistema (THERMALACUARIUM_LANG, LANGUAGE, LC_ALL, LC_MESSAGES, LANG, /etc/locale.conf).
+
+use std::fs;
+
+#[derive(Clone, Copy, PartialEq)]
+enum Lang {
+    En,
+    Es,
+    Fr,
+    De,
+    Pt,
+    It,
+}
+
+fn lang() -> Lang {
+    static L: std::sync::OnceLock<Lang> = std::sync::OnceLock::new();
+    *L.get_or_init(|| {
+        let mut cands: Vec<String> = ["THERMALACUARIUM_LANG", "LANGUAGE", "LC_ALL", "LC_MESSAGES", "LANG"]
+            .iter()
+            .filter_map(|k| std::env::var(k).ok())
+            .filter(|v| !v.is_empty())
+            .collect();
+        if let Ok(c) = fs::read_to_string("/etc/locale.conf") {
+            for l in c.lines() {
+                if let Some(v) = l.strip_prefix("LANG=") {
+                    cands.push(v.trim().trim_matches('"').to_string());
+                }
+            }
+        }
+        for c in cands {
+            for part in c.split(':') {
+                let code = part.to_lowercase();
+                if code == "c" || code.starts_with("c.") || code == "posix" || code.len() < 2 {
+                    continue;
+                }
+                match code.get(..2) {
+                    Some("es") => return Lang::Es,
+                    Some("fr") => return Lang::Fr,
+                    Some("de") => return Lang::De,
+                    Some("pt") => return Lang::Pt,
+                    Some("it") => return Lang::It,
+                    Some("en") => return Lang::En,
+                    _ => {}
+                }
+            }
+        }
+        Lang::En
+    })
+}
+
+// clave -> [en, es, fr, de, pt, it]
+const STR: &[(&str, [&str; 6])] = &[
+    ("about", ["About", "Acerca de", "À propos", "Info", "Sobre", "Informazioni"]),
+    ("about_comments", [
+        "An aquarium that is your computer: every process is a fish",
+        "Un acuario que es tu ordenador: cada proceso es un pez",
+        "Un aquarium qui est votre ordinateur : chaque processus est un poisson",
+        "Ein Aquarium, das dein Computer ist: Jeder Prozess ist ein Fisch",
+        "Um aquário que é o seu computador: cada processo é um peixe",
+        "Un acquario che è il tuo computer: ogni processo è un pesce",
+    ]),
+    ("style_real", ["REALISTIC", "REALISTA", "RÉALISTE", "REALISTISCH", "REALISTA", "REALISTICO"]),
+    ("style_toon", ["STYLIZED", "ESTILIZADO", "STYLISÉ", "STILISIERT", "ESTILIZADO", "STILIZZATO"]),
+    ("style_tip", ["Switch visual style (T)", "Cambiar de estilo visual (T)", "Changer de style visuel (T)", "Darstellung wechseln (T)", "Mudar o estilo visual (T)", "Cambia stile visivo (T)"]),
+    ("style_toast", ["Style: {}", "Estilo: {}", "Style : {}", "Stil: {}", "Estilo: {}", "Stile: {}"]),
+    ("paused", ["PAUSED", "PAUSA", "PAUSE", "PAUSE", "PAUSADO", "PAUSA"]),
+    ("chip_disk", ["DISK W", "DISCO E", "DISQUE É", "DISK S", "DISCO E", "DISCO S"]),
+    ("ram_of", ["{}% of {}", "{}% de {}", "{}% sur {}", "{}% von {}", "{}% de {}", "{}% di {}"]),
+    ("fish_n", ["{} fish", "{} peces", "{} poissons", "{} Fische", "{} peixes", "{} pesci"]),
+    ("hidden", ["+{} not shown", "+{} sin mostrar", "+{} masqués", "+{} ausgeblendet", "+{} ocultos", "+{} nascosti"]),
+    ("shoal", ["shoal of {}", "banco de {}", "banc de {}", "Schwarm aus {}", "cardume de {}", "banco di {}"]),
+    ("write_s", ["write {}/s", "escribe {}/s", "écrit {}/s", "schreibt {}/s", "grava {}/s", "scrive {}/s"]),
+    ("protected_tag", ["protected", "protegido", "protégé", "geschützt", "protegido", "protetto"]),
+    ("sensors_tip", ["GPU {} · NVMe {}", "GPU {} · NVMe {}", "GPU {} · NVMe {}", "GPU {} · NVMe {}", "GPU {} · NVMe {}", "GPU {} · NVMe {}"]),
+    ("kill_head", [
+        "Close this process?",
+        "¿Cerrar este proceso?",
+        "Fermer ce processus ?",
+        "Prozess beenden?",
+        "Fechar este processo?",
+        "Chiudere questo processo?",
+    ]),
+    ("kill_body", [
+        "{}\nPID {} · {}% CPU · {}\n\nA close request will be sent; if it doesn't respond within 3 s, it will be forced.",
+        "{}\nPID {} · {}% CPU · {}\n\nSe enviará una orden de cierre y, si no responde en 3 s, se forzará.",
+        "{}\nPID {} · {}% CPU · {}\n\nUne demande de fermeture sera envoyée ; sans réponse sous 3 s, l'arrêt sera forcé.",
+        "{}\nPID {} · {}% CPU · {}\n\nEs wird eine Beenden-Anfrage gesendet; ohne Antwort innerhalb von 3 s wird erzwungen.",
+        "{}\nPID {} · {}% CPU · {}\n\nSerá enviado um pedido de encerramento e, se não responder em 3 s, será forçado.",
+        "{}\nPID {} · {}% CPU · {}\n\nVerrà inviata una richiesta di chiusura e, se non risponde entro 3 s, verrà forzata.",
+    ]),
+    ("kill_one", ["Close this one", "Cerrar solo este", "Fermer celui-ci", "Nur diesen beenden", "Fechar só este", "Chiudi solo questo"]),
+    ("kill_proc", ["Close process", "Cerrar proceso", "Fermer le processus", "Prozess beenden", "Fechar processo", "Chiudi processo"]),
+    ("kill_all", ["Close all {}", "Cerrar los {}", "Fermer les {}", "Alle {} beenden", "Fechar os {}", "Chiudi tutti i {}"]),
+    ("cancel", ["Cancel", "Cancelar", "Annuler", "Abbrechen", "Cancelar", "Annulla"]),
+    ("closing", ["Closing {}…", "Cerrando {}…", "Fermeture de {}…", "{} wird beendet…", "Fechando {}…", "Chiusura di {}…"]),
+    ("protected_msg", [
+        "{} is part of your desktop session: it lives in the tank as decoration and can't be closed from here",
+        "{} forma parte de tu sesión de escritorio: vive en la pecera como decoración y no se puede cerrar desde aquí",
+        "{} fait partie de votre session de bureau : il sert de décor et ne peut pas être fermé d'ici",
+        "{} gehört zu deiner Desktop-Sitzung: Es dient als Dekoration und kann hier nicht beendet werden",
+        "{} faz parte da sua sessão de desktop: serve de decoração e não pode ser fechado daqui",
+        "{} fa parte della sessione desktop: è solo decorazione e non può essere chiuso da qui",
+    ]),
+];
+
+fn idx() -> usize {
+    match lang() {
+        Lang::En => 0,
+        Lang::Es => 1,
+        Lang::Fr => 2,
+        Lang::De => 3,
+        Lang::Pt => 4,
+        Lang::It => 5,
+    }
+}
+
+pub fn tr(k: &str) -> &'static str {
+    STR.iter().find(|(key, _)| *key == k).map_or("?", |(_, v)| v[idx()])
+}
+
+/// Traduce y sustituye cada `{}` por el siguiente argumento.
+pub fn trf(k: &str, args: &[String]) -> String {
+    let mut s = tr(k).to_string();
+    for a in args {
+        if let Some(i) = s.find("{}") {
+            s.replace_range(i..i + 2, a);
+        }
+    }
+    s
+}
