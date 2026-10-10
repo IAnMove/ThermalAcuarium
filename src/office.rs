@@ -68,6 +68,8 @@ pub struct Office {
     disk_cards: RefCell<Vec<(String, gtk::Label, gtk::Label, gtk::Label, gtk::ProgressBar)>>,
     dtop_list: gtk::Box,
     dtop_rows: RefCell<Vec<(gtk::Label, gtk::Label, gtk::ProgressBar)>>,
+    /// Pestaña Sensores: CPU, GPU, NVMe (con historial), ventilador y carga.
+    sens: Vec<Card>,
     pal: Rc<RefCell<Palette>>,
     pub on_close: RefCell<Option<Rc<dyn Fn(&str)>>>,
 }
@@ -162,7 +164,7 @@ impl Office {
         let stack = gtk::Stack::new();
         stack.set_vexpand(true);
         let mut tabs = vec![];
-        for (i, key) in ["tab_procs", "tab_mem", "tab_disks", "tab_perf"].iter().enumerate() {
+        for (i, key) in ["tab_procs", "tab_mem", "tab_disks", "tab_sensors", "tab_perf"].iter().enumerate() {
             let b = gtk::ToggleButton::with_label(tr(key));
             if i == 0 {
                 b.set_active(true);
@@ -287,6 +289,33 @@ impl Office {
         dv.append(&scroll);
         stack.add_named(&dv, Some("disks"));
 
+        // --- Sensores
+        let sg = gtk::Grid::new();
+        sg.set_row_spacing(8);
+        sg.set_column_spacing(8);
+        sg.set_row_homogeneous(true);
+        sg.set_column_homogeneous(true);
+        sg.set_margin_top(8);
+        sg.set_margin_bottom(12);
+        sg.set_margin_start(12);
+        sg.set_margin_end(12);
+        let mut sens = vec![];
+        for (i, (key, col, max)) in [
+            ("sens_cpu", (|p: &Palette| p.orange) as fn(&Palette) -> Rgb, Some(105.0)),
+            ("sens_gpu", |p: &Palette| p.yellow, Some(105.0)),
+            ("sens_nvme", |p: &Palette| p.cyan, Some(105.0)),
+            ("sens_fan", |p: &Palette| p.accent, None),
+            ("sens_load", |p: &Palette| p.green, None),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let (b, c) = card(tr(key), &pal, mk_hist(), col, max);
+            sg.attach(&b, (i % 3) as i32, (i / 3) as i32, 1, 1);
+            sens.push(c);
+        }
+        stack.add_named(&sg, Some("sensors"));
+
         let o = Rc::new(Office {
             root,
             stack,
@@ -308,6 +337,7 @@ impl Office {
             disk_cards: RefCell::new(vec![]),
             dtop_list,
             dtop_rows: RefCell::new(vec![]),
+            sens,
             pal,
             on_close: RefCell::new(None),
         });
@@ -316,7 +346,7 @@ impl Office {
             let o2 = o.clone();
             t.connect_toggled(move |b| {
                 if b.is_active() {
-                    o2.stack.set_visible_child_name(["procs", "mem", "disks", "perf"][i]);
+                    o2.stack.set_visible_child_name(["procs", "mem", "disks", "sensors", "perf"][i]);
                 }
             });
         }
@@ -423,6 +453,51 @@ impl Office {
                 p.set_visible(false);
             }
         }
+    }
+
+    /// Tarjetas de la pestaña Sensores.
+    pub fn refresh_sensors(&self, r: &Reading, temp: Option<f64>) {
+        let push = |c: &Card, v: f64| {
+            let mut h = c.hist.borrow_mut();
+            if h.len() == HIST {
+                h.pop_front();
+            }
+            h.push_back(v);
+            c.area.queue_draw();
+        };
+        let deg = |c: &Card, v: Option<f64>, zone: bool| match v {
+            Some(t) => {
+                push(c, t);
+                c.value.set_text(&format!("{t:.0}°"));
+                if zone {
+                    c.sub.set_text(if t >= crate::weather::CRIT {
+                        tr("wx_crit")
+                    } else if t >= crate::weather::HOT {
+                        tr("wx_hot")
+                    } else if t >= crate::weather::WARM {
+                        tr("wx_warm")
+                    } else {
+                        tr("wx_cool")
+                    });
+                }
+            }
+            None => c.value.set_text("--"),
+        };
+        deg(&self.sens[0], temp, true);
+        deg(&self.sens[1], r.gpu, false);
+        deg(&self.sens[2], r.nvme, false);
+        match r.fan {
+            Some(f) => {
+                push(&self.sens[3], f as f64);
+                self.sens[3].value.set_text(&format!("{f} rpm"));
+                if let Some(m) = r.fan_max {
+                    self.sens[3].sub.set_text(&format!("{:.0}% · max {m} rpm", f as f64 / m.max(1) as f64 * 100.0));
+                }
+            }
+            None => self.sens[3].value.set_text("--"),
+        }
+        push(&self.sens[4], r.load);
+        self.sens[4].value.set_text(&format!("{:.2}", r.load));
     }
 
     /// Tarjetas de la pestaña Discos (una por disco físico).

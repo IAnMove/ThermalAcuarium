@@ -23,6 +23,9 @@ pub struct Reading {
     pub gpu: Option<f64>,
     pub nvme: Option<f64>,
     pub load: f64,
+    /// Ventilador más rápido (rpm) y su máximo conocido, si el equipo los expone.
+    pub fan: Option<i64>,
+    pub fan_max: Option<i64>,
 }
 
 pub struct Sensors {
@@ -57,7 +60,20 @@ impl Sensors {
             .ok()
             .and_then(|s| s.split_whitespace().next().and_then(|x| x.parse().ok()))
             .unwrap_or(0.0);
-        Reading { cpu, gpu: self.temp("amdgpu"), nvme: self.temp("nvme"), load }
+        let (mut fan, mut fan_max) = (None, None);
+        for paths in self.by_name.values() {
+            for p in paths {
+                for i in 1..=8 {
+                    if let Some(v) = rd_int(&format!("{p}/fan{i}_input")) {
+                        fan = Some(fan.map_or(v, |f: i64| f.max(v)));
+                        if let Some(m) = rd_int(&format!("{p}/fan{i}_max")) {
+                            fan_max = Some(fan_max.map_or(m, |f: i64| f.max(m)));
+                        }
+                    }
+                }
+            }
+        }
+        Reading { cpu, gpu: self.temp("amdgpu"), nvme: self.temp("nvme"), load, fan, fan_max }
     }
 }
 

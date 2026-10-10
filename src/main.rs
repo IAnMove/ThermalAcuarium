@@ -11,6 +11,7 @@ mod reef;
 mod rivers;
 mod sonar;
 mod volcano;
+mod weather;
 mod sim;
 mod sys;
 mod theme;
@@ -108,6 +109,7 @@ struct Ui {
     arcade_tabs: Vec<gtk::ToggleButton>,
     volcano: Rc<RefCell<volcano::Volcano>>,
     rivers: Rc<RefCell<rivers::Rivers>>,
+    weather: Rc<RefCell<weather::Weather>>,
     vpal: Rc<RefCell<Palette>>,
 }
 
@@ -134,6 +136,8 @@ fn update_sensors(ui: &Rc<Ui>) {
     let temp = demo_temp().or(r.cpu);
     m.tank.set_env(temp, r.load / ncpu(), s.ram_used, s.ram_total, s.disk_w);
     ui.office.refresh_perf(&s, &r, temp);
+    ui.office.refresh_sensors(&r, temp);
+    ui.weather.borrow_mut().set_reading(&r, temp);
     ui.office.refresh_mem(&s);
     // THERMALACUARIUM_DEMO_MEM=0.95 fuerza el uso de RAM para ver el volcán en erupción.
     let demo = std::env::var("THERMALACUARIUM_DEMO_MEM").ok().and_then(|v| v.parse::<f64>().ok());
@@ -455,7 +459,7 @@ fn build_ui(app: &adw::Application) {
     let arcade = gtk::Stack::new();
     arcade.set_vexpand(true);
     let mut arcade_tabs = vec![];
-    for (i, key) in ["tab_procs", "tab_mem", "tab_disks"].iter().enumerate() {
+    for (i, key) in ["tab_procs", "tab_mem", "tab_disks", "tab_sensors"].iter().enumerate() {
         let b = gtk::ToggleButton::with_label(tr(key));
         if i == 0 {
             b.set_active(true);
@@ -475,11 +479,14 @@ fn build_ui(app: &adw::Application) {
     let riv = Rc::new(RefCell::new(rivers::Rivers::new()));
     let riv_area = rivers::widget(riv.clone(), vpal.clone(), m.borrow().font.clone());
     arcade.add_named(&riv_area, Some("rivers"));
+    let wx = Rc::new(RefCell::new(weather::Weather::new(ncpu())));
+    let wx_area = weather::widget(wx.clone(), vpal.clone(), m.borrow().font.clone());
+    arcade.add_named(&wx_area, Some("weather"));
     for (i, t) in arcade_tabs.iter().enumerate() {
         let st = arcade.clone();
         t.connect_toggled(move |b| {
             if b.is_active() {
-                st.set_visible_child_name(["tank", "volcano", "rivers"][i]);
+                st.set_visible_child_name(["tank", "volcano", "rivers", "weather"][i]);
             }
         });
     }
@@ -526,7 +533,7 @@ fn build_ui(app: &adw::Application) {
     tv.set_content(Some(&toasts));
     win.set_content(Some(&tv));
 
-    let ui = Rc::new(Ui { m: m.clone(), win: win.clone(), area: area.clone(), toasts, provider, chips, style_btn: style_btn.clone(), mode_btn: mode_btn.clone(), pages, office: office.clone(), arcade_tabs, volcano: vol, rivers: riv, vpal });
+    let ui = Rc::new(Ui { m: m.clone(), win: win.clone(), area: area.clone(), toasts, provider, chips, style_btn: style_btn.clone(), mode_btn: mode_btn.clone(), pages, office: office.clone(), arcade_tabs, volcano: vol, rivers: riv, weather: wx, vpal });
     let u = ui.clone();
     mode_btn.connect_clicked(move |_| toggle_mode(&u));
     let u = ui.clone();
@@ -598,12 +605,13 @@ fn build_ui(app: &adw::Application) {
             }
             gdk::Key::t | gdk::Key::T => toggle_style(&u),
             gdk::Key::o | gdk::Key::O => toggle_mode(&u),
-            gdk::Key::_1 | gdk::Key::_2 | gdk::Key::_3 | gdk::Key::_4 => {
+            gdk::Key::_1 | gdk::Key::_2 | gdk::Key::_3 | gdk::Key::_4 | gdk::Key::_5 => {
                 let i = match key {
                     gdk::Key::_1 => 0,
                     gdk::Key::_2 => 1,
                     gdk::Key::_3 => 2,
-                    _ => 3,
+                    gdk::Key::_4 => 3,
+                    _ => 4,
                 };
                 if u.m.borrow().office {
                     u.office.show_tab(i);

@@ -35,16 +35,29 @@ the lava flows running down the slope, and swap cracks the plain open. Past ~90 
 
 ## Disks tab: rivers
 
-**Disks** turns every physical disk into a river. It winds down the plateau (its width is the disk's
-read+write throughput, log scale, with the current visibly flowing), plunges over the cliff as a
-waterfall (writes) and fills a reservoir whose **level is the disk's occupancy**, read against the
-0–100 % scale on the dam. The programs doing the most disk I/O are the tributaries joining the river
-(↓ read, ↑ write). Partitions and device‑mapper volumes (LUKS, btrfs subvolumes) are folded into their
-physical disk.
+**Disks** turns every physical disk into a river running down a valley. **The riverbed is the whole
+disk**: the water fills it from the left bank in proportion to the space used, and the dry gravel left
+on the right is the free space, with a 0–100 % rule across the bed at the cliff edge. Disk activity
+(read + write, log scale) is the speed of the current; the water then plunges over the cliff into a
+reservoir whose level repeats the occupancy on the dam's gauge. The programs doing the most disk I/O
+are the tributaries joining the river (↓ read, ↑ write). Partitions and device‑mapper volumes (LUKS,
+btrfs subvolumes) are folded into their physical disk.
 
 ![Rivers](docs/rivers.png)
 
-Office mode has matching **Memory** and **Disks** tabs with the plain numbers.
+## Sensors tab: the weather
+
+**Sensors** is the weather report. The CPU temperature is the weather itself: cool means a clear sky
+and a soft sun; warm, haze; hot, a heat wave with the air shimmering and the grass scorched; critical,
+a firestorm with lightning and falling embers. The fans are the wind (clouds race, trees and grass
+bend), the load average is the cloud cover, and a thermometer on the right shows CPU, GPU and NVMe on
+a 30–105 °C scale with the warm/hot/critical bands. `--temp 99` previews the storm.
+
+| 55 °C | 99 °C |
+| :--- | :--- |
+| ![](docs/weather.png) | ![](docs/weather-firestorm.png) |
+
+Office mode has matching **Memory**, **Disks** and **Sensors** tabs with the plain numbers.
 
 ## Office mode: a plain task manager
 
@@ -60,7 +73,7 @@ the same Omarchy theme. The choice is remembered.
 
 ![Office mode](docs/office.png)
 
-`thermalacuarium --office` starts there. A sensors tab (weather) is planned.
+`thermalacuarium --office` starts there. Every tab has an arcade skin and an office view.
 
 ## Four visual styles
 
@@ -96,7 +109,7 @@ their natural colors (a clownfish is still orange). Preview other themes without
 - **Hover** a fish: name, PID, RAM, CPU, disk writes. Its shoal lights up.
 - **Click** a fish: confirm dialog → close that process (or the whole shoal). It sends `SIGTERM` and,
   if the process is still the same one after 3 s, `SIGKILL`. The fish floats belly‑up while it dies.
-- `L` cycles name labels (big shoals / all / none) · `Space` pauses · `T` switches style · `O` toggles office mode · `1`–`4` pick a tab · the ⓘ button in the header opens *About* (with the link to the author's X, [@theinaog](https://x.com/theinaog)).
+- `L` cycles name labels (big shoals / all / none) · `Space` pauses · `T` switches style · `O` toggles office mode · `1`–`5` pick a tab · the ⓘ button in the header opens *About* (with the link to the author's X, [@theinaog](https://x.com/theinaog)).
 - Processes that start swim in from the sides; processes that exit dissolve into bubbles.
 
 Only processes of your own user are shown. The tank holds the 180 biggest.
