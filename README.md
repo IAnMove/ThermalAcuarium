@@ -62,7 +62,7 @@ omarchy plugin add https://github.com/IAnMove/ThermalAcuarium --enable
 ```
 
 That is all. The bar widget shows the CPU temperature (🐠, or 🫧 when the water would be boiling).
-The first time you click it, the plugin downloads the app (~1.5 MB, from this repo's releases, with its
+The first time you click it, the plugin downloads the app (~1.1 MB, from this repo's releases, with its
 sha256 checked) into its own folder and opens it; after that it starts instantly. Click opens the
 aquarium, right‑click opens another window. `omarchy plugin update` keeps it current (the launcher
 fetches the binary of the new version when `manifest.json` changes).

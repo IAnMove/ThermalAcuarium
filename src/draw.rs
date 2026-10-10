@@ -478,6 +478,7 @@ struct FinDef {
     flow: f64,
 }
 
+#[allow(dead_code)]
 struct Species {
     ratio: f64,
     tail_frac: f64,
@@ -909,6 +910,7 @@ struct SpriteCache {
     bytes: usize,
     pal: String,
     ds: f64,
+    cell: f64,
 }
 
 thread_local! {
@@ -967,11 +969,13 @@ fn blit_fish(cr: &Context, f: &Fish, pal: &Palette, ds: f64, style: Style) {
     let (key, blen) = sprite_key(f, style);
     SPRITES.with(|c| {
         let mut c = c.borrow_mut();
-        if c.pal != pal.raw || (c.ds - ds).abs() > 0.01 {
+        // La rejilla cambia con el tamaño de la pecera: los sprites de píxeles se rehacen.
+        if c.pal != pal.raw || (c.ds - ds).abs() > 0.01 || (c.cell - cell()).abs() > 0.01 {
             c.map.clear();
             c.bytes = 0;
             c.pal = pal.raw.clone();
             c.ds = ds;
+            c.cell = cell();
         }
         if c.bytes > MAX_SPRITE_BYTES {
             c.map.clear();
