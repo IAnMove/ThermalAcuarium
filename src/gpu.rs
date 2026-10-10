@@ -136,6 +136,18 @@ fn bake(w: f64, h: f64, ds: f64, paint: impl FnOnce(&cairo::Context)) -> Option<
     texture_of(surf)
 }
 
+/// Como `bake`, pero a una celda por píxel: se amplía luego con `ScalingFilter::Nearest`.
+fn bake_px(w: f64, h: f64, cell: f64, paint: impl FnOnce(&cairo::Context)) -> Option<gdk::MemoryTexture> {
+    let surf = cairo::ImageSurface::create(cairo::Format::ARgb32, (w / cell).ceil().max(1.0) as i32, (h / cell).ceil().max(1.0) as i32).ok()?;
+    {
+        let cr = cairo::Context::new(&surf).ok()?;
+        cr.set_antialias(cairo::Antialias::None);
+        cr.scale(1.0 / cell, 1.0 / cell);
+        paint(&cr);
+    }
+    texture_of(surf)
+}
+
 // ---------------------------------------------------------------- helpers de GSK
 
 pub(crate) fn rect(x: f64, y: f64, w: f64, h: f64) -> graphene::Rect {
@@ -236,22 +248,26 @@ pub fn render(widget: &gtk::Widget, snap: &gtk::Snapshot, v: &View, cache: &mut 
         return;
     }
 
+    draw::set_cell(t.scale());
+    let cell = draw::cell();
     let full = rect(0.0, 0.0, w, h);
-    let (top_c, bot_c) = draw::water_colors(v);
+    let (top_c, _) = draw::water_colors(v);
     let b = t.boil;
 
-    // Agua.
-    snap.append_linear_gradient(&full, &pt(0.0, 0.0), &pt(0.0, h), &stops(&[(0.0, top_c, 1.0), (1.0, bot_c, 1.0)]));
+    // Agua: franjas planas.
+    for (y0, y1, c) in draw::water_bands(v) {
+        snap.append_color(&col(c, 1.0), &rect(0.0, y0, w, y1 - y0 + 0.5));
+    }
 
-    // Rayos de luz: una textura estática que se desplaza despacio.
+    // Rayos de luz: una textura de píxeles estática que se desplaza a saltos de celda.
     if cache.rays.is_none() {
-        cache.rays = bake(w, h, ds, |cr| draw::rays(cr, v, 0.0, 0.0));
+        cache.rays = bake_px(w, h, cell, |cr| draw::rays(cr, v, 0.0, 0.0));
     }
     if let Some(tex) = &cache.rays {
         snap.save();
-        snap.translate(&pt((t.t * 0.15).sin() * w * 0.03, 0.0));
+        snap.translate(&pt(draw::snap((t.t * 0.15).sin() * w * 0.03), 0.0));
         snap.push_opacity(1.0 - 0.5 * b);
-        snap.append_texture(tex, &full);
+        snap.append_scaled_texture(tex, gsk::ScalingFilter::Nearest, &full);
         snap.pop();
         snap.restore();
     }
@@ -259,10 +275,9 @@ pub fn render(widget: &gtk::Widget, snap: &gtk::Snapshot, v: &View, cache: &mut 
     // Nieve marina.
     let mote = col(lighten(top_c, 0.7), 1.0);
     for m in &t.motes {
-        let r = 0.7 + 1.4 * m.z;
         let mut c = mote;
         c.set_alpha((0.10 + 0.22 * m.z) as f32);
-        snap.append_color(&c, &rect(m.x - r, m.y - r, 2.0 * r, 2.0 * r));
+        snap.append_color(&c, &rect(draw::snap(m.x), draw::snap(m.y), cell, cell));
     }
 
     // Resplandor del fondo, arena, brillo de los respiraderos.
@@ -384,21 +399,21 @@ fn decor(snap: &gtk::Snapshot, cache: &mut GpuCache, v: &View, ds: f64) {
             .iter()
             .enumerate()
             .filter_map(|(i, d)| {
-                let x = d.xf * t.w;
-                let base = t.floor_y(x) + 5.0;
-                let (bx, by) = (x - d.size * 0.7 - 6.0, base - d.size * 1.15 - 6.0);
-                let (bw, bh) = (d.size * 1.4 + 12.0, d.size * 1.15 + 6.0 + 14.0);
-                let hover = v.hover == Some(Pick::Decor(i));
-                let tex = bake(bw, bh, ds, |cr| {
+                let (bx, by, bw, bh) = draw::decor_box(t, d);
+                let _ = (i, ds);
+                let tex = bake_px(bw, bh, draw::cell(), |cr| {
                     cr.translate(-bx, -by);
-                    draw::decor(cr, v, d, hover);
+                    draw::decor(cr, v, d, false);
                 })?;
-                Some(DecorTex { tex, rect: rect(bx, by, bw, bh) })
+                Some(DecorTex { tex, rect: rect(draw::snap(bx), draw::snap(by), bw, bh) })
             })
             .collect();
     }
-    for d in &cache.decor {
-        snap.append_texture(&d.tex, &d.rect);
+    for (i, d) in cache.decor.iter().enumerate() {
+        snap.append_scaled_texture(&d.tex, gsk::ScalingFilter::Nearest, &d.rect);
+        if v.hover == Some(Pick::Decor(i)) {
+            outline(snap, &d.rect, &col(v.pal.accent, 0.6));
+        }
     }
 }
 
@@ -426,9 +441,11 @@ fn sprite<'a>(cache: &'a mut GpuCache, v: &View, i: usize, ds: f64) -> Option<&'
         let (wp, hp) = (spr.surf.width(), spr.surf.height());
         let tex = texture_of(spr.surf)?;
         cache.bytes += (wp * hp * 4) as usize;
+        // Los sprites de píxeles no llevan escala de dispositivo: una celda por píxel.
+        let k = if key.real { 1.0 / ds } else { draw::cell() };
         cache.sprites.insert(
             key,
-            GpuSprite { tex, w: (wp as f64 / ds) as f32, h: (hp as f64 / ds) as f32, ox: spr.ox as f32, oy: spr.oy as f32, len: spr.len },
+            GpuSprite { tex, w: (wp as f64 * k) as f32, h: (hp as f64 * k) as f32, ox: spr.ox as f32, oy: spr.oy as f32, len: spr.len },
         );
     }
     cache.sprites.get(&key)
@@ -441,19 +458,31 @@ pub(crate) fn fish(snap: &gtk::Snapshot, cache: &mut GpuCache, v: &View, i: usiz
     }
     let hl = v.hover == Some(Pick::Fish(i));
     let Some(s) = sprite(cache, v, i, ds) else { return };
-    let k = (f.len / s.len) as f32;
+    let pixel = v.style == Style::Cartoon;
     let nz = |x: f64| if x.abs() < 0.03 { 0.03f64.copysign(if x == 0.0 { 1.0 } else { x }) } else { x } as f32;
     snap.save();
-    snap.translate(&pt(f.x, f.y));
-    snap.scale(nz(f.face), nz(f.flipv));
-    snap.rotate((-f.pitch).to_degrees() as f32);
-    snap.scale(k, k);
+    if pixel {
+        // Píxeles: posición en la rejilla, volteo entero, sin giro ni escalado fraccionario.
+        snap.translate(&pt(draw::snap(f.x), draw::snap(f.y)));
+        snap.scale(nz(f.face).signum(), nz(f.flipv).signum());
+    } else {
+        let k = (f.len / s.len) as f32;
+        snap.translate(&pt(f.x, f.y));
+        snap.scale(nz(f.face), nz(f.flipv));
+        snap.rotate((-f.pitch).to_degrees() as f32);
+        snap.scale(k, k);
+    }
     let alpha = f.alpha * draw::depth_alpha(f, v.style);
     let fade = alpha < 0.99;
     if fade {
         snap.push_opacity(alpha.clamp(0.0, 1.0));
     }
-    snap.append_texture(&s.tex, &graphene::Rect::new(-s.ox, -s.oy, s.w, s.h));
+    let bounds = graphene::Rect::new(-s.ox, -s.oy, s.w, s.h);
+    if pixel {
+        snap.append_scaled_texture(&s.tex, gsk::ScalingFilter::Nearest, &bounds);
+    } else {
+        snap.append_texture(&s.tex, &bounds);
+    }
     if fade {
         snap.pop();
     }
@@ -475,28 +504,24 @@ pub(crate) fn fish(snap: &gtk::Snapshot, cache: &mut GpuCache, v: &View, i: usiz
 
 fn bubbles(snap: &gtk::Snapshot, v: &View, top_c: Rgb) {
     let c = lighten(top_c, 0.85);
-    let (ring_c, fill_c, hi_c) = (col(c, 0.55), col(c, 0.10), col((1.0, 1.0, 1.0), 0.7));
+    let cell = draw::cell();
+    let (edge, fill, dot, foam) = (col(c, 0.45), col(c, 0.12), col(c, 0.55), col(v.pal.bfg, 1.0));
     for b in &v.tank.bubbles {
+        let k = (b.r * 2.0 / cell).round().clamp(1.0, 4.0);
+        let (x, y) = (draw::snap(b.x - b.r), draw::snap(b.y - b.r));
         match b.kind {
+            BubbleKind::Air if k <= 1.0 => snap.append_color(&dot, &rect(x, y, cell, cell)),
             BubbleKind::Air => {
-                let r = b.r;
-                if r < 1.8 {
-                    // Las diminutas son un punto.
-                    snap.append_color(&col(c, 0.4), &rect(b.x - r, b.y - r, 2.0 * r, 2.0 * r));
-                    continue;
-                }
-                let bounds = rect(b.x - r, b.y - r, 2.0 * r, 2.0 * r);
-                if r > 2.5 {
-                    disc(snap, &bounds, r as f32, &fill_c);
-                }
-                ring(snap, &bounds, r as f32, 1.0, &ring_c);
-                if r > 3.5 {
-                    snap.append_color(&hi_c, &rect(b.x - b.r * 0.41, b.y - b.r * 0.41, b.r * 0.44, b.r * 0.44));
-                }
+                snap.append_color(&fill, &rect(x, y, k * cell, k * cell));
+                snap.append_color(&edge, &rect(x, y, k * cell, cell));
+                snap.append_color(&edge, &rect(x, y + (k - 1.0) * cell, k * cell, cell));
+                snap.append_color(&edge, &rect(x, y, cell, k * cell));
+                snap.append_color(&edge, &rect(x + (k - 1.0) * cell, y, cell, k * cell));
             }
             BubbleKind::Foam => {
-                let k = (b.life / b.max_life).clamp(0.0, 1.0);
-                disc(snap, &rect(b.x - b.r, b.y - b.r, 2.0 * b.r, 2.0 * b.r), b.r as f32, &col((1.0, 1.0, 1.0), 0.40 * k.sqrt()));
+                let mut f = foam;
+                f.set_alpha((0.40 * (b.life / b.max_life).clamp(0.0, 1.0).sqrt()) as f32);
+                snap.append_color(&f, &rect(x, y, k * cell, cell));
             }
         }
     }

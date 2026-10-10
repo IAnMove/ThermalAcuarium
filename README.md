@@ -24,7 +24,7 @@ Fish are procedural (spine‑driven body, tail and fins), not flat sprites.
 Press **`T`** (or click the style button in the header) to switch; the choice is remembered
 (`~/.config/thermalacuarium/style`, or start with `--style real|stylized`).
 
-- **Stylized** (default): pastel fish painted with your Omarchy theme colors.
+- **Stylized** (default): pixel art in the spirit of the Omarchy logo. Fish, bubbles and corals sit on one shared pixel grid, painted flat with your Omarchy theme colors (no gradients, no gloss), with a one‑pixel ink outline and a one‑pixel eye. It recolors live when you change theme.
 - **Realistic**: a reef aquarium. 15 species with real anatomy and coloring (clownfish, blue and
   yellow tang, royal gramma, chromis, butterflyfish, angelfish, mandarin dragonet, anthias, cardinalfish,
   damselfish, pufferfish, wrasse, lionfish, grouper) with countershading, scales, fin rays and
