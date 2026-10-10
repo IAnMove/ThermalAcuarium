@@ -10,7 +10,7 @@ use adw::prelude::*;
 use gtk::cairo;
 
 use crate::i18n::{tr, trf};
-use crate::sys::{Group, Reading, SysReading, fmt_bytes};
+use crate::sys::{Disk, Group, Reading, SysReading, fmt_bytes};
 use crate::theme::{Palette, Rgb};
 
 pub const HIST: usize = 120;
@@ -63,6 +63,11 @@ pub struct Office {
     mem_cards: Vec<(gtk::Label, gtk::Label, gtk::ProgressBar)>,
     top_list: gtk::Box,
     top_rows: RefCell<Vec<(gtk::Label, gtk::Label, gtk::ProgressBar)>>,
+    /// Pestaña Discos: una tarjeta por disco y la lista de los procesos con más E/S.
+    disk_box: gtk::Box,
+    disk_cards: RefCell<Vec<(String, gtk::Label, gtk::Label, gtk::Label, gtk::ProgressBar)>>,
+    dtop_list: gtk::Box,
+    dtop_rows: RefCell<Vec<(gtk::Label, gtk::Label, gtk::ProgressBar)>>,
     pal: Rc<RefCell<Palette>>,
     pub on_close: RefCell<Option<Rc<dyn Fn(&str)>>>,
 }
@@ -157,7 +162,7 @@ impl Office {
         let stack = gtk::Stack::new();
         stack.set_vexpand(true);
         let mut tabs = vec![];
-        for (i, key) in ["tab_procs", "tab_mem", "tab_perf"].iter().enumerate() {
+        for (i, key) in ["tab_procs", "tab_mem", "tab_disks", "tab_perf"].iter().enumerate() {
             let b = gtk::ToggleButton::with_label(tr(key));
             if i == 0 {
                 b.set_active(true);
@@ -264,6 +269,24 @@ impl Office {
         memv.append(&scroll);
         stack.add_named(&memv, Some("mem"));
 
+        // --- Discos
+        let dv = gtk::Box::new(gtk::Orientation::Vertical, 8);
+        dv.set_margin_top(8);
+        dv.set_margin_bottom(12);
+        dv.set_margin_start(12);
+        dv.set_margin_end(12);
+        let disk_box = gtk::Box::new(gtk::Orientation::Horizontal, 8);
+        disk_box.set_homogeneous(true);
+        dv.append(&disk_box);
+        let dt = gtk::Label::builder().label(tr("disk_top")).xalign(0.0).build();
+        dt.add_css_class("cardlabel");
+        dt.set_margin_top(6);
+        dv.append(&dt);
+        let dtop_list = gtk::Box::new(gtk::Orientation::Vertical, 0);
+        let scroll = gtk::ScrolledWindow::builder().hscrollbar_policy(gtk::PolicyType::Never).vexpand(true).child(&dtop_list).build();
+        dv.append(&scroll);
+        stack.add_named(&dv, Some("disks"));
+
         let o = Rc::new(Office {
             root,
             stack,
@@ -281,6 +304,10 @@ impl Office {
             mem_cards,
             top_list,
             top_rows: RefCell::new(vec![]),
+            disk_box,
+            disk_cards: RefCell::new(vec![]),
+            dtop_list,
+            dtop_rows: RefCell::new(vec![]),
             pal,
             on_close: RefCell::new(None),
         });
@@ -289,7 +316,7 @@ impl Office {
             let o2 = o.clone();
             t.connect_toggled(move |b| {
                 if b.is_active() {
-                    o2.stack.set_visible_child_name(["procs", "mem", "perf"][i]);
+                    o2.stack.set_visible_child_name(["procs", "mem", "disks", "perf"][i]);
                 }
             });
         }
@@ -392,6 +419,84 @@ impl Office {
                 name.set_text(k);
                 mem.set_text(&fmt_bytes(*m));
                 bar.set_fraction((m / ram_total.max(1.0)).clamp(0.0, 1.0));
+            } else {
+                p.set_visible(false);
+            }
+        }
+    }
+
+    /// Tarjetas de la pestaña Discos (una por disco físico).
+    pub fn refresh_disks(&self, disks: &[Disk]) {
+        let mut cards = self.disk_cards.borrow_mut();
+        if cards.len() != disks.len() || cards.iter().zip(disks).any(|(c, d)| c.0 != d.name) {
+            while let Some(c) = self.disk_box.first_child() {
+                self.disk_box.remove(&c);
+            }
+            cards.clear();
+            for d in disks {
+                let b = gtk::Box::new(gtk::Orientation::Vertical, 2);
+                b.add_css_class("card");
+                let t = gtk::Label::builder().label(&d.name).xalign(0.0).build();
+                t.add_css_class("cardlabel");
+                let v = gtk::Label::builder().label("--").xalign(0.0).build();
+                v.add_css_class("cardvalue");
+                let io = gtk::Label::builder().label(" ").xalign(0.0).build();
+                io.add_css_class("cardsub");
+                let mp = gtk::Label::builder().label(" ").xalign(0.0).ellipsize(gtk::pango::EllipsizeMode::End).build();
+                mp.add_css_class("cardsub");
+                let bar = gtk::ProgressBar::new();
+                for w in [&t, &v, &io, &mp] {
+                    b.append(w);
+                }
+                b.append(&bar);
+                self.disk_box.append(&b);
+                cards.push((d.name.clone(), v, io, mp, bar));
+            }
+        }
+        for ((_, v, io, mp, bar), d) in cards.iter().zip(disks) {
+            let (u, t) = (d.used(), d.total().max(1.0));
+            v.set_text(&format!("{} / {}", fmt_bytes(u), fmt_bytes(t)));
+            io.set_text(&format!("{} {}/s   {} {}/s", tr("disk_read"), fmt_bytes(d.rbps), tr("disk_write_t"), fmt_bytes(d.wbps)));
+            mp.set_text(&d.mounts.iter().map(|m| m.0.as_str()).collect::<Vec<_>>().join("  "));
+            bar.set_fraction((u / t).clamp(0.0, 1.0));
+        }
+    }
+
+    /// Procesos con más E/S de disco.
+    pub fn refresh_disk_top(&self, groups: &[Group]) {
+        let mut v: Vec<(String, f64, f64)> = groups
+            .iter()
+            .map(|g| (g.key.clone(), g.procs.iter().map(|p| p.rbps).sum::<f64>(), g.procs.iter().map(|p| p.wbps).sum::<f64>()))
+            .filter(|(_, r, w)| r.max(*w) >= 1e3)
+            .collect();
+        v.sort_by(|a, b| (b.1 + b.2).partial_cmp(&(a.1 + a.2)).unwrap_or(std::cmp::Ordering::Equal));
+        v.truncate(12);
+        let top = v.first().map_or(1.0, |x| (x.1 + x.2).max(1.0));
+        let mut rows = self.dtop_rows.borrow_mut();
+        while rows.len() < v.len() {
+            let b = gtk::Box::new(gtk::Orientation::Vertical, 3);
+            b.add_css_class("procrow");
+            let line = gtk::Box::new(gtk::Orientation::Horizontal, 8);
+            let name = cell(0.0, 200);
+            name.add_css_class("procname");
+            name.set_hexpand(true);
+            let io = cell(1.0, 200);
+            io.add_css_class("procmeta");
+            line.append(&name);
+            line.append(&io);
+            let bar = gtk::ProgressBar::new();
+            b.append(&line);
+            b.append(&bar);
+            self.dtop_list.append(&b);
+            rows.push((name, io, bar));
+        }
+        for (i, (name, io, bar)) in rows.iter().enumerate() {
+            let Some(p) = name.parent().and_then(|t| t.parent()) else { continue };
+            if let Some((k, r, w)) = v.get(i) {
+                p.set_visible(true);
+                name.set_text(k);
+                io.set_text(&format!("↓ {}/s  ↑ {}/s", fmt_bytes(*r), fmt_bytes(*w)));
+                bar.set_fraction(((r + w) / top).clamp(0.0, 1.0));
             } else {
                 p.set_visible(false);
             }

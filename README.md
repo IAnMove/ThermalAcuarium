@@ -21,19 +21,30 @@ Fish are procedural (spine‑driven body, tail and fins), not flat sprites.
 
 ## Memory tab: the volcano
 
-Arcade mode has tabs too (`1`/`2`, or the tab bar): **Processes** is the aquarium, **Memory** is a
-volcano. RAM in use is the crater's activity: a little smoke when memory is low, lava bubbling at
-half, lava bombs and bright flows when high, and a full eruption with ash plume, bomb rain and
-ground shake when RAM is maxed out. Free memory is the snow cap (it melts as memory fills), the
-programs using the most RAM are the lava flows running down the slopes, and swap cracks the plain
-open. `THERMALACUARIUM_DEMO_MEM=0.97` previews the eruption.
+Arcade mode has tabs (`1`/`2`/`3`, or the tab bar): **Processes** is the aquarium, **Memory** is a
+volcano drawn in cross‑section, like a textbook diagram. The left half is the outside; the right half
+is cut open and shows the magma chamber, and **the magma level is exactly the RAM in use**, read
+against a 0–100 % scale next to it. Cache & buffers are the crust of cooler magma on top, the free
+memory is the snow cap on the outside (it melts as memory fills), the programs using the most RAM are
+the lava flows running down the slope, and swap cracks the plain open. Past ~90 % the crater erupts
+(bombs, ash, ground shake) and the lava overflows the rim. `THERMALACUARIUM_DEMO_MEM=0.97` previews it.
 
-| Half full | Maxed out |
+| 55 % | 97 % |
 | :--- | :--- |
 | ![](docs/volcano.png) | ![](docs/volcano-erupting.png) |
 
-Office mode gets a matching **Memory** tab: in use, cache & buffers, available and swap, plus the
-top programs by RAM.
+## Disks tab: rivers
+
+**Disks** turns every physical disk into a river. It winds down the plateau (its width is the disk's
+read+write throughput, log scale, with the current visibly flowing), plunges over the cliff as a
+waterfall (writes) and fills a reservoir whose **level is the disk's occupancy**, read against the
+0–100 % scale on the dam. The programs doing the most disk I/O are the tributaries joining the river
+(↓ read, ↑ write). Partitions and device‑mapper volumes (LUKS, btrfs subvolumes) are folded into their
+physical disk.
+
+![Rivers](docs/rivers.png)
+
+Office mode has matching **Memory** and **Disks** tabs with the plain numbers.
 
 ## Office mode: a plain task manager
 
@@ -49,7 +60,7 @@ the same Omarchy theme. The choice is remembered.
 
 ![Office mode](docs/office.png)
 
-`thermalacuarium --office` starts there. More tabs with their own "arcade" skins (disks as rivers, sensors as weather) are planned.
+`thermalacuarium --office` starts there. A sensors tab (weather) is planned.
 
 ## Four visual styles
 
@@ -85,7 +96,7 @@ their natural colors (a clownfish is still orange). Preview other themes without
 - **Hover** a fish: name, PID, RAM, CPU, disk writes. Its shoal lights up.
 - **Click** a fish: confirm dialog → close that process (or the whole shoal). It sends `SIGTERM` and,
   if the process is still the same one after 3 s, `SIGKILL`. The fish floats belly‑up while it dies.
-- `L` cycles name labels (big shoals / all / none) · `Space` pauses · `T` switches style · `O` toggles office mode · `1`/`2`/`3` pick a tab · the ⓘ button in the header opens *About* (with the link to the author's X, [@theinaog](https://x.com/theinaog)).
+- `L` cycles name labels (big shoals / all / none) · `Space` pauses · `T` switches style · `O` toggles office mode · `1`–`4` pick a tab · the ⓘ button in the header opens *About* (with the link to the author's X, [@theinaog](https://x.com/theinaog)).
 - Processes that start swim in from the sides; processes that exit dissolve into bubbles.
 
 Only processes of your own user are shown. The tank holds the 180 biggest.

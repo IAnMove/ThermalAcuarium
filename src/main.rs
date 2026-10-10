@@ -8,6 +8,7 @@ mod i18n;
 mod office;
 mod pixel;
 mod reef;
+mod rivers;
 mod sonar;
 mod volcano;
 mod sim;
@@ -25,7 +26,7 @@ use gtk::{gdk, gio, glib};
 use draw::View;
 use i18n::{tr, trf};
 use sim::{Pick, Tank};
-use sys::{Group, ProcSampler, Sensors, SysSampler, comm_of, fmt_bytes};
+use sys::{DiskSampler, Group, ProcSampler, Sensors, SysSampler, comm_of, fmt_bytes};
 use theme::{Palette, Rgb, Style, current_font, to_hex};
 
 const APP_ID: &str = "dev.ina.thermalacuarium";
@@ -69,6 +70,7 @@ struct Model {
     font: String,
     sensors: Sensors,
     sys: SysSampler,
+    disks: DiskSampler,
     procs: ProcSampler,
     hover: Option<Pick>,
     cursor: Option<(f64, f64)>,
@@ -105,6 +107,7 @@ struct Ui {
     /// Pestañas del modo Arcade (pecera, volcán).
     arcade_tabs: Vec<gtk::ToggleButton>,
     volcano: Rc<RefCell<volcano::Volcano>>,
+    rivers: Rc<RefCell<rivers::Rivers>>,
     vpal: Rc<RefCell<Palette>>,
 }
 
@@ -125,6 +128,9 @@ fn update_sensors(ui: &Rc<Ui>) {
     let m = &mut *guard;
     let r = m.sensors.read();
     let s = m.sys.sample();
+    let disks = m.disks.sample();
+    ui.rivers.borrow_mut().set_disks(&disks);
+    ui.office.refresh_disks(&disks);
     let temp = demo_temp().or(r.cpu);
     m.tank.set_env(temp, r.load / ncpu(), s.ram_used, s.ram_total, s.disk_w);
     ui.office.refresh_perf(&s, &r, temp);
@@ -159,6 +165,8 @@ fn sample_procs(ui: &Rc<Ui>) {
     let ram_total = m.tank.ram_total;
     m.groups = groups;
     ui.volcano.borrow_mut().set_groups(&m.groups);
+    ui.rivers.borrow_mut().set_groups(&m.groups);
+    ui.office.refresh_disk_top(&m.groups);
     if m.office {
         ui.office.refresh_procs(&m.groups, ram_total);
         ui.office.refresh_top(&m.groups, ram_total);
@@ -193,7 +201,7 @@ fn toggle_mode(ui: &Rc<Ui>) {
 fn confirm_kill_group(ui: &Rc<Ui>, key: &str) {
     let Some(g) = ui.m.borrow().groups.iter().find(|g| g.key == key).cloned() else { return };
     if g.protected {
-        ui.toasts.add_toast(adw::Toast::new(&trf("protected_msg", &[g.key.clone()])));
+        ui.toasts.add_toast(adw::Toast::new(&trf("protected_msg", std::slice::from_ref(&g.key))));
         return;
     }
     let pids: Vec<i32> = g.procs.iter().map(|p| p.pid).collect();
@@ -412,6 +420,7 @@ fn build_ui(app: &adw::Application) {
         font: current_font(),
         sensors: Sensors::new(),
         sys: SysSampler::default(),
+        disks: DiskSampler::default(),
         procs: ProcSampler::new(),
         hover: None,
         cursor: None,
@@ -446,7 +455,7 @@ fn build_ui(app: &adw::Application) {
     let arcade = gtk::Stack::new();
     arcade.set_vexpand(true);
     let mut arcade_tabs = vec![];
-    for (i, key) in ["tab_procs", "tab_mem"].iter().enumerate() {
+    for (i, key) in ["tab_procs", "tab_mem", "tab_disks"].iter().enumerate() {
         let b = gtk::ToggleButton::with_label(tr(key));
         if i == 0 {
             b.set_active(true);
@@ -463,11 +472,14 @@ fn build_ui(app: &adw::Application) {
     let vol = Rc::new(RefCell::new(volcano::Volcano::new()));
     let vol_area = volcano::widget(vol.clone(), vpal.clone(), m.borrow().font.clone());
     arcade.add_named(&vol_area, Some("volcano"));
+    let riv = Rc::new(RefCell::new(rivers::Rivers::new()));
+    let riv_area = rivers::widget(riv.clone(), vpal.clone(), m.borrow().font.clone());
+    arcade.add_named(&riv_area, Some("rivers"));
     for (i, t) in arcade_tabs.iter().enumerate() {
         let st = arcade.clone();
         t.connect_toggled(move |b| {
             if b.is_active() {
-                st.set_visible_child_name(if i == 0 { "tank" } else { "volcano" });
+                st.set_visible_child_name(["tank", "volcano", "rivers"][i]);
             }
         });
     }
@@ -514,7 +526,7 @@ fn build_ui(app: &adw::Application) {
     tv.set_content(Some(&toasts));
     win.set_content(Some(&tv));
 
-    let ui = Rc::new(Ui { m: m.clone(), win: win.clone(), area: area.clone(), toasts, provider, chips, style_btn: style_btn.clone(), mode_btn: mode_btn.clone(), pages, office: office.clone(), arcade_tabs, volcano: vol, vpal });
+    let ui = Rc::new(Ui { m: m.clone(), win: win.clone(), area: area.clone(), toasts, provider, chips, style_btn: style_btn.clone(), mode_btn: mode_btn.clone(), pages, office: office.clone(), arcade_tabs, volcano: vol, rivers: riv, vpal });
     let u = ui.clone();
     mode_btn.connect_clicked(move |_| toggle_mode(&u));
     let u = ui.clone();
@@ -586,11 +598,12 @@ fn build_ui(app: &adw::Application) {
             }
             gdk::Key::t | gdk::Key::T => toggle_style(&u),
             gdk::Key::o | gdk::Key::O => toggle_mode(&u),
-            gdk::Key::_1 | gdk::Key::_2 | gdk::Key::_3 => {
+            gdk::Key::_1 | gdk::Key::_2 | gdk::Key::_3 | gdk::Key::_4 => {
                 let i = match key {
                     gdk::Key::_1 => 0,
                     gdk::Key::_2 => 1,
-                    _ => 2,
+                    gdk::Key::_3 => 2,
+                    _ => 3,
                 };
                 if u.m.borrow().office {
                     u.office.show_tab(i);

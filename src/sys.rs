@@ -164,6 +164,7 @@ pub struct Proc {
     pub cpu: f64,
     pub mem: f64,
     pub wbps: f64,
+    pub rbps: f64,
 }
 
 /// Procesos con el mismo nombre: un banco.
@@ -175,7 +176,7 @@ pub struct Group {
 }
 
 pub struct ProcSampler {
-    prev: HashMap<i32, (u64, u64, u64)>, // pid -> (start, ticks, bytes escritos)
+    prev: HashMap<i32, (u64, u64, u64, u64)>, // pid -> (start, ticks, bytes escritos, bytes leídos)
     prev_t: Option<Instant>,
     clk: f64,
     page: f64,
@@ -183,14 +184,11 @@ pub struct ProcSampler {
     self_pid: i32,
 }
 
-fn read_write_bytes(pid: i32) -> u64 {
-    fs::read_to_string(format!("/proc/{pid}/io"))
-        .ok()
-        .and_then(|s| {
-            s.lines()
-                .find_map(|l| l.strip_prefix("write_bytes:").and_then(|v| v.trim().parse().ok()))
-        })
-        .unwrap_or(0)
+/// (bytes escritos, bytes leídos) a disco por el proceso.
+fn read_io_bytes(pid: i32) -> (u64, u64) {
+    let Ok(s) = fs::read_to_string(format!("/proc/{pid}/io")) else { return (0, 0) };
+    let get = |k: &str| s.lines().find_map(|l| l.strip_prefix(k).and_then(|v| v.trim().parse().ok())).unwrap_or(0);
+    (get("write_bytes:"), get("read_bytes:"))
 }
 
 impl ProcSampler {
@@ -248,18 +246,20 @@ impl ProcSampler {
                 let prev = self.prev.get(&pid).filter(|p| p.0 == start).copied();
                 let prev_tick = prev.map_or(ticks, |p| p.1);
                 // Solo se mira el I/O si el proceso corrió o tiene memoria apreciable.
-                let wb = if ticks > prev_tick || rss > 2500.0 {
-                    read_write_bytes(pid)
+                let (wb, rb) = if ticks > prev_tick || rss > 2500.0 {
+                    read_io_bytes(pid)
                 } else {
-                    prev.map_or(0, |p| p.2)
+                    prev.map_or((0, 0), |p| (p.2, p.3))
                 };
-                cur.insert(pid, (start, ticks, wb));
-                let mut p = Proc { pid, start, cpu: 0.0, mem: rss.max(0.0) * self.page, wbps: 0.0 };
-                if let (Some(dt), Some((_, pt, pw))) = (dt, prev)
-                    && dt > 0.0 {
-                        p.cpu = ticks.saturating_sub(pt) as f64 / self.clk / dt * 100.0;
-                        p.wbps = wb.saturating_sub(pw) as f64 / dt;
-                    }
+                cur.insert(pid, (start, ticks, wb, rb));
+                let mut p = Proc { pid, start, cpu: 0.0, mem: rss.max(0.0) * self.page, wbps: 0.0, rbps: 0.0 };
+                if let (Some(dt), Some((_, pt, pw, pr))) = (dt, prev)
+                    && dt > 0.0
+                {
+                    p.cpu = ticks.saturating_sub(pt) as f64 / self.clk / dt * 100.0;
+                    p.wbps = wb.saturating_sub(pw) as f64 / dt;
+                    p.rbps = rb.saturating_sub(pr) as f64 / dt;
+                }
                 let key = Self::key(comm, pid);
                 groups
                     .entry(key.clone())
@@ -274,6 +274,122 @@ impl ProcSampler {
     }
 }
 
+// ---------------------------------------------------------------- discos
+
+/// Un disco físico: caudal de lectura/escritura y ocupación de sus sistemas de archivos.
+#[derive(Clone, Debug)]
+pub struct Disk {
+    pub name: String,
+    pub rbps: f64,
+    pub wbps: f64,
+    /// Sistemas de archivos montados en él: (punto de montaje, usado, total).
+    pub mounts: Vec<(String, f64, f64)>,
+}
+
+impl Disk {
+    pub fn used(&self) -> f64 {
+        self.mounts.iter().map(|m| m.1).sum()
+    }
+    pub fn total(&self) -> f64 {
+        self.mounts.iter().map(|m| m.2).sum()
+    }
+}
+
+#[derive(Default)]
+pub struct DiskSampler {
+    prev: HashMap<String, (u64, u64, Instant)>,
+    /// Caché de la resolución dispositivo → disco físico.
+    parent: HashMap<String, String>,
+}
+
+impl DiskSampler {
+    /// Disco físico al que pertenece un dispositivo (partición o device-mapper).
+    fn parent_of(&mut self, dev: &str) -> Option<String> {
+        if let Some(p) = self.parent.get(dev) {
+            return Some(p.clone());
+        }
+        let mut name = dev.trim_start_matches("/dev/").to_string();
+        if let Some(m) = name.strip_prefix("mapper/") {
+            // /dev/mapper/<nombre> → dm-N
+            name = fs::read_dir("/sys/class/block")
+                .ok()?
+                .flatten()
+                .map(|e| e.file_name().to_string_lossy().into_owned())
+                .find(|n| n.starts_with("dm-") && fs::read_to_string(format!("/sys/class/block/{n}/dm/name")).map(|s| s.trim() == m).unwrap_or(false))?;
+        }
+        let mut cur = name.clone();
+        for _ in 0..6 {
+            if is_whole_disk(&cur) {
+                self.parent.insert(dev.to_string(), cur.clone());
+                return Some(cur);
+            }
+            if cur.starts_with("dm-") {
+                let slave = fs::read_dir(format!("/sys/class/block/{cur}/slaves")).ok()?.flatten().next()?;
+                cur = slave.file_name().to_string_lossy().into_owned();
+            } else {
+                // Partición: quita el sufijo (nvme0n1p2 → nvme0n1, sda3 → sda).
+                let t = cur.trim_end_matches(|c: char| c.is_ascii_digit()).to_string();
+                cur = t.strip_suffix('p').filter(|s| s.starts_with("nvme") || s.starts_with("mmcblk")).map(str::to_string).unwrap_or(t);
+            }
+        }
+        None
+    }
+
+    pub fn sample(&mut self) -> Vec<Disk> {
+        let now = Instant::now();
+        let mut disks: Vec<Disk> = vec![];
+        if let Ok(s) = fs::read_to_string("/proc/diskstats") {
+            for l in s.lines() {
+                let p: Vec<&str> = l.split_whitespace().collect();
+                if p.len() <= 9 || !is_whole_disk(p[2]) {
+                    continue;
+                }
+                let (rd, wr) = (p[5].parse::<u64>().unwrap_or(0) * 512, p[9].parse::<u64>().unwrap_or(0) * 512);
+                let (mut rbps, mut wbps) = (0.0, 0.0);
+                if let Some((pr, pw, pt)) = self.prev.get(p[2]) {
+                    let dt = now.duration_since(*pt).as_secs_f64();
+                    if dt > 0.0 {
+                        rbps = rd.saturating_sub(*pr) as f64 / dt;
+                        wbps = wr.saturating_sub(*pw) as f64 / dt;
+                    }
+                }
+                self.prev.insert(p[2].to_string(), (rd, wr, now));
+                disks.push(Disk { name: p[2].to_string(), rbps, wbps, mounts: vec![] });
+            }
+        }
+        // Sistemas de archivos: uno por dispositivo (btrfs monta el mismo varias veces).
+        let mut seen_dev = std::collections::HashSet::new();
+        if let Ok(m) = fs::read_to_string("/proc/mounts") {
+            for l in m.lines() {
+                let p: Vec<&str> = l.split_whitespace().collect();
+                if p.len() < 3 || !p[0].starts_with("/dev/") || !seen_dev.insert(p[0].to_string()) {
+                    continue;
+                }
+                let Some(parent) = self.parent_of(p[0]) else { continue };
+                let mp = p[1].replace("\\040", " ");
+                let Some((used, total)) = statvfs(&mp) else { continue };
+                if let Some(d) = disks.iter_mut().find(|d| d.name == parent) {
+                    d.mounts.push((mp, used, total));
+                }
+            }
+        }
+        // Solo discos con algo montado (fuera quedan zram, loops…).
+        disks.retain(|d| !d.mounts.is_empty());
+        disks
+    }
+}
+
+fn statvfs(path: &str) -> Option<(f64, f64)> {
+    let c = std::ffi::CString::new(path).ok()?;
+    let mut st: libc::statvfs = unsafe { std::mem::zeroed() };
+    if unsafe { libc::statvfs(c.as_ptr(), &mut st) } != 0 {
+        return None;
+    }
+    let total = st.f_blocks as f64 * st.f_frsize as f64;
+    let free = st.f_bavail as f64 * st.f_frsize as f64;
+    Some(((total - free).max(0.0), total))
+}
+
 pub fn comm_of(pid: i32) -> Option<String> {
     fs::read_to_string(format!("/proc/{pid}/comm")).ok()
 }
@@ -285,5 +401,18 @@ pub fn fmt_bytes(b: f64) -> String {
         format!("{:.0} MB", b / 1e6)
     } else {
         format!("{:.0} KB", b / 1e3)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn disks_have_mounts_and_capacity() {
+        let mut s = DiskSampler::default();
+        let d = s.sample();
+        eprintln!("{d:#?}");
+        assert!(d.iter().any(|d| d.total() > 1e9), "ningún disco con capacidad: {d:?}");
     }
 }
