@@ -9,6 +9,7 @@ mod office;
 mod pixel;
 mod reef;
 mod sonar;
+mod volcano;
 mod sim;
 mod sys;
 mod theme;
@@ -101,6 +102,10 @@ struct Ui {
     mode_btn: gtk::Button,
     pages: gtk::Stack,
     office: Rc<office::Office>,
+    /// Pestañas del modo Arcade (pecera, volcán).
+    arcade_tabs: Vec<gtk::ToggleButton>,
+    volcano: Rc<RefCell<volcano::Volcano>>,
+    vpal: Rc<RefCell<Palette>>,
 }
 
 fn chip(pal: &Palette, key: &str, val: &str, vcol: Option<Rgb>) -> String {
@@ -123,6 +128,11 @@ fn update_sensors(ui: &Rc<Ui>) {
     let temp = demo_temp().or(r.cpu);
     m.tank.set_env(temp, r.load / ncpu(), s.ram_used, s.ram_total, s.disk_w);
     ui.office.refresh_perf(&s, &r, temp);
+    ui.office.refresh_mem(&s);
+    // THERMALACUARIUM_DEMO_MEM=0.95 fuerza el uso de RAM para ver el volcán en erupción.
+    let demo = std::env::var("THERMALACUARIUM_DEMO_MEM").ok().and_then(|v| v.parse::<f64>().ok());
+    let used = demo.map_or(s.ram_used, |f| f * s.ram_total);
+    ui.volcano.borrow_mut().set_memory(used, s.ram_total, s.cached, demo.map_or(s.swap_used, |f| f * s.swap_total.max(1.0)), s.swap_total.max(if demo.is_some() { 1.0 } else { 0.0 }));
 
     let pal = &m.pal;
     let f = |v: Option<f64>| v.map_or("--".to_string(), |v| format!("{v:.0}°"));
@@ -148,8 +158,10 @@ fn sample_procs(ui: &Rc<Ui>) {
     m.tank.sync(&groups, first);
     let ram_total = m.tank.ram_total;
     m.groups = groups;
+    ui.volcano.borrow_mut().set_groups(&m.groups);
     if m.office {
         ui.office.refresh_procs(&m.groups, ram_total);
+        ui.office.refresh_top(&m.groups, ram_total);
     }
 }
 
@@ -291,6 +303,7 @@ fn apply_theme(ui: &Rc<Ui>, force: bool) {
         adw::ColorScheme::ForceLight
     });
     ui.office.set_palette(&new);
+    *ui.vpal.borrow_mut() = new.clone();
     ui.m.borrow_mut().pal = new;
     ui.area.queue_draw();
 }
@@ -423,8 +436,43 @@ fn build_ui(app: &adw::Application) {
     let area = gpu::TankWidget::new();
     area.set_hexpand(true);
     area.set_vexpand(true);
+    // Modo Arcade: pestañas Procesos (pecera) y Memoria (volcán).
+    let arcade_box = gtk::Box::new(gtk::Orientation::Vertical, 0);
+    let atabs = gtk::Box::new(gtk::Orientation::Horizontal, 0);
+    atabs.add_css_class("tabs");
+    atabs.set_margin_top(6);
+    atabs.set_margin_start(12);
+    atabs.set_margin_bottom(6);
+    let arcade = gtk::Stack::new();
+    arcade.set_vexpand(true);
+    let mut arcade_tabs = vec![];
+    for (i, key) in ["tab_procs", "tab_mem"].iter().enumerate() {
+        let b = gtk::ToggleButton::with_label(tr(key));
+        if i == 0 {
+            b.set_active(true);
+        } else {
+            b.set_group(Some(&arcade_tabs[0]));
+        }
+        atabs.append(&b);
+        arcade_tabs.push(b);
+    }
+    arcade_box.append(&atabs);
+    arcade_box.append(&arcade);
+    arcade.add_named(&area, Some("tank"));
+    let vpal = Rc::new(RefCell::new(m.borrow().pal.clone()));
+    let vol = Rc::new(RefCell::new(volcano::Volcano::new()));
+    let vol_area = volcano::widget(vol.clone(), vpal.clone(), m.borrow().font.clone());
+    arcade.add_named(&vol_area, Some("volcano"));
+    for (i, t) in arcade_tabs.iter().enumerate() {
+        let st = arcade.clone();
+        t.connect_toggled(move |b| {
+            if b.is_active() {
+                st.set_visible_child_name(if i == 0 { "tank" } else { "volcano" });
+            }
+        });
+    }
     let pages = gtk::Stack::new();
-    pages.add_named(&area, Some("tank"));
+    pages.add_named(&arcade_box, Some("tank"));
     let office = office::Office::new(m.borrow().pal.clone());
     pages.add_named(&office.root, Some("office"));
     pages.set_visible_child_name(if m.borrow().office { "office" } else { "tank" });
@@ -466,7 +514,7 @@ fn build_ui(app: &adw::Application) {
     tv.set_content(Some(&toasts));
     win.set_content(Some(&tv));
 
-    let ui = Rc::new(Ui { m: m.clone(), win: win.clone(), area: area.clone(), toasts, provider, chips, style_btn: style_btn.clone(), mode_btn: mode_btn.clone(), pages, office: office.clone() });
+    let ui = Rc::new(Ui { m: m.clone(), win: win.clone(), area: area.clone(), toasts, provider, chips, style_btn: style_btn.clone(), mode_btn: mode_btn.clone(), pages, office: office.clone(), arcade_tabs, volcano: vol, vpal });
     let u = ui.clone();
     mode_btn.connect_clicked(move |_| toggle_mode(&u));
     let u = ui.clone();
@@ -538,6 +586,18 @@ fn build_ui(app: &adw::Application) {
             }
             gdk::Key::t | gdk::Key::T => toggle_style(&u),
             gdk::Key::o | gdk::Key::O => toggle_mode(&u),
+            gdk::Key::_1 | gdk::Key::_2 | gdk::Key::_3 => {
+                let i = match key {
+                    gdk::Key::_1 => 0,
+                    gdk::Key::_2 => 1,
+                    _ => 2,
+                };
+                if u.m.borrow().office {
+                    u.office.show_tab(i);
+                } else if let Some(b) = u.arcade_tabs.get(i) {
+                    b.set_active(true);
+                }
+            }
             gdk::Key::space => {
                 let mut m = u.m.borrow_mut();
                 m.paused = !m.paused;

@@ -71,6 +71,9 @@ pub struct SysReading {
     pub ram_total: f64,
     pub disk_w: f64,
     pub disk_r: f64,
+    pub cached: f64,
+    pub swap_total: f64,
+    pub swap_used: f64,
 }
 
 #[derive(Default)]
@@ -108,17 +111,25 @@ impl SysSampler {
                 }
             }
         if let Ok(s) = fs::read_to_string("/proc/meminfo") {
-            let (mut total, mut avail) = (0.0, 0.0);
+            let (mut total, mut avail, mut cached, mut st, mut sf) = (0.0, 0.0, 0.0, 0.0, 0.0);
             for l in s.lines() {
                 let mut it = l.split_whitespace();
+                let v = |it: &mut std::str::SplitWhitespace| it.next().and_then(|x| x.parse::<f64>().ok()).unwrap_or(0.0);
                 match it.next() {
-                    Some("MemTotal:") => total = it.next().and_then(|x| x.parse().ok()).unwrap_or(0.0),
-                    Some("MemAvailable:") => avail = it.next().and_then(|x| x.parse().ok()).unwrap_or(0.0),
+                    Some("MemTotal:") => total = v(&mut it),
+                    Some("MemAvailable:") => avail = v(&mut it),
+                    Some("Cached:") => cached += v(&mut it),
+                    Some("Buffers:") => cached += v(&mut it),
+                    Some("SwapTotal:") => st = v(&mut it),
+                    Some("SwapFree:") => sf = v(&mut it),
                     _ => {}
                 }
             }
             r.ram_total = total * 1024.0;
             r.ram_used = (total - avail) * 1024.0;
+            r.cached = cached * 1024.0;
+            r.swap_total = st * 1024.0;
+            r.swap_used = (st - sf) * 1024.0;
         }
         if let Ok(s) = fs::read_to_string("/proc/diskstats") {
             let (mut w, mut rd) = (0u64, 0u64);

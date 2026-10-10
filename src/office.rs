@@ -59,6 +59,10 @@ pub struct Office {
     ram: Card,
     disk: Card,
     temp: Card,
+    /// Pestaña Memoria: tarjetas (valor, barra) y lista de los que más usan.
+    mem_cards: Vec<(gtk::Label, gtk::Label, gtk::ProgressBar)>,
+    top_list: gtk::Box,
+    top_rows: RefCell<Vec<(gtk::Label, gtk::Label, gtk::ProgressBar)>>,
     pal: Rc<RefCell<Palette>>,
     pub on_close: RefCell<Option<Rc<dyn Fn(&str)>>>,
 }
@@ -153,7 +157,7 @@ impl Office {
         let stack = gtk::Stack::new();
         stack.set_vexpand(true);
         let mut tabs = vec![];
-        for (i, key) in ["tab_procs", "tab_perf"].iter().enumerate() {
+        for (i, key) in ["tab_procs", "tab_mem", "tab_perf"].iter().enumerate() {
             let b = gtk::ToggleButton::with_label(tr(key));
             if i == 0 {
                 b.set_active(true);
@@ -223,6 +227,43 @@ impl Office {
         perf.attach(&bt, 1, 1, 1, 1);
         stack.add_named(&perf, Some("perf"));
 
+        // --- Memoria
+        let memv = gtk::Box::new(gtk::Orientation::Vertical, 8);
+        memv.set_margin_top(8);
+        memv.set_margin_bottom(12);
+        memv.set_margin_start(12);
+        memv.set_margin_end(12);
+        let memg = gtk::Grid::new();
+        memg.set_column_spacing(8);
+        memg.set_column_homogeneous(true);
+        let mut mem_cards = vec![];
+        for (i, key) in ["mem_used", "mem_cache", "mem_free", "mem_swap_t"].iter().enumerate() {
+            let b = gtk::Box::new(gtk::Orientation::Vertical, 2);
+            b.add_css_class("card");
+            let t = gtk::Label::builder().label(tr(key)).xalign(0.0).build();
+            t.add_css_class("cardlabel");
+            let v = gtk::Label::builder().label("--").xalign(0.0).build();
+            v.add_css_class("cardvalue");
+            let sb = gtk::Label::builder().label(" ").xalign(0.0).build();
+            sb.add_css_class("cardsub");
+            let bar = gtk::ProgressBar::new();
+            for w in [&t, &v, &sb] {
+                b.append(w);
+            }
+            b.append(&bar);
+            memg.attach(&b, i as i32, 0, 1, 1);
+            mem_cards.push((v, sb, bar));
+        }
+        memv.append(&memg);
+        let top_t = gtk::Label::builder().label(tr("mem_top")).xalign(0.0).build();
+        top_t.add_css_class("cardlabel");
+        top_t.set_margin_top(6);
+        memv.append(&top_t);
+        let top_list = gtk::Box::new(gtk::Orientation::Vertical, 0);
+        let scroll = gtk::ScrolledWindow::builder().hscrollbar_policy(gtk::PolicyType::Never).vexpand(true).child(&top_list).build();
+        memv.append(&scroll);
+        stack.add_named(&memv, Some("mem"));
+
         let o = Rc::new(Office {
             root,
             stack,
@@ -237,6 +278,9 @@ impl Office {
             ram,
             disk,
             temp,
+            mem_cards,
+            top_list,
+            top_rows: RefCell::new(vec![]),
             pal,
             on_close: RefCell::new(None),
         });
@@ -245,7 +289,7 @@ impl Office {
             let o2 = o.clone();
             t.connect_toggled(move |b| {
                 if b.is_active() {
-                    o2.stack.set_visible_child_name(if i == 0 { "procs" } else { "perf" });
+                    o2.stack.set_visible_child_name(["procs", "mem", "perf"][i]);
                 }
             });
         }
@@ -292,6 +336,65 @@ impl Office {
         for (i, (key, _, _)) in COLS.iter().enumerate() {
             let t = if i == c { format!("{} {}", tr(key), if desc { "▼" } else { "▲" }) } else { tr(key).to_string() };
             self.heads[i].set_label(&t);
+        }
+    }
+
+    pub fn show_tab(&self, i: usize) {
+        if let Some(t) = self.tabs.get(i) {
+            t.set_active(true);
+        }
+    }
+
+    /// Tarjetas de la pestaña Memoria.
+    pub fn refresh_mem(&self, s: &SysReading) {
+        let total = s.ram_total.max(1.0);
+        let free = (s.ram_total - s.ram_used).max(0.0);
+        let vals = [
+            (s.ram_used, total, format!("{:.0}%", s.ram_used / total * 100.0)),
+            (s.cached, total, format!("{:.0}%", s.cached / total * 100.0)),
+            (free, total, trf("ram_of", &[format!("{:.0}", free / total * 100.0), fmt_bytes(s.ram_total)])),
+            (s.swap_used, s.swap_total.max(1.0), if s.swap_total > 0.0 { trf("mem_swap", &[fmt_bytes(s.swap_used), fmt_bytes(s.swap_total)]) } else { "–".into() }),
+        ];
+        for ((v, sb, bar), (val, max, sub)) in self.mem_cards.iter().zip(vals.iter()) {
+            v.set_text(&fmt_bytes(*val));
+            sb.set_text(sub);
+            bar.set_fraction((val / max).clamp(0.0, 1.0));
+        }
+    }
+
+    /// Lista de los programas que más RAM usan.
+    pub fn refresh_top(&self, groups: &[Group], ram_total: f64) {
+        let mut v: Vec<(String, f64)> = groups.iter().map(|g| (g.key.clone(), g.procs.iter().map(|p| p.mem).sum())).collect();
+        v.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+        v.truncate(15);
+        let mut rows = self.top_rows.borrow_mut();
+        while rows.len() < v.len() {
+            let b = gtk::Box::new(gtk::Orientation::Vertical, 3);
+            b.add_css_class("procrow");
+            let top = gtk::Box::new(gtk::Orientation::Horizontal, 8);
+            let name = cell(0.0, 200);
+            name.add_css_class("procname");
+            name.set_hexpand(true);
+            let mem = cell(1.0, 90);
+            mem.add_css_class("procmeta");
+            top.append(&name);
+            top.append(&mem);
+            let bar = gtk::ProgressBar::new();
+            b.append(&top);
+            b.append(&bar);
+            self.top_list.append(&b);
+            rows.push((name, mem, bar));
+        }
+        for (i, (name, mem, bar)) in rows.iter().enumerate() {
+            let Some(p) = name.parent().and_then(|t| t.parent()) else { continue };
+            if let Some((k, m)) = v.get(i) {
+                p.set_visible(true);
+                name.set_text(k);
+                mem.set_text(&fmt_bytes(*m));
+                bar.set_fraction((m / ram_total.max(1.0)).clamp(0.0, 1.0));
+            } else {
+                p.set_visible(false);
+            }
         }
     }
 
