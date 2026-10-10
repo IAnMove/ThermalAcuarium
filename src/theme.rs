@@ -79,12 +79,28 @@ pub struct Palette {
     stops: [(f64, Rgb); 5],
 }
 
+/// Tema de Omarchy forzado (`--theme tokyo-night` o THERMALACUARIUM_THEME), para probar otros temas
+/// sin cambiar el del sistema.
+fn theme_override() -> Option<String> {
+    let a: Vec<String> = std::env::args().collect();
+    a.iter().position(|x| x == "--theme").and_then(|i| a.get(i + 1).cloned()).or_else(|| std::env::var("THERMALACUARIUM_THEME").ok())
+}
+
 impl Palette {
     pub fn load() -> Self {
         let home = std::env::var("HOME").unwrap_or_default();
         let base = format!("{home}/.local/state/omarchy/current");
-        let txt = fs::read_to_string(format!("{base}/theme/colors.toml")).unwrap_or_default();
-        let name = fs::read_to_string(format!("{base}/theme.name")).unwrap_or_default();
+        let (txt, name) = match theme_override() {
+            Some(n) => {
+                let read = |dir: &str| fs::read_to_string(format!("{dir}/{n}/colors.toml")).ok();
+                let txt = read(&format!("{home}/.config/omarchy/themes")).or_else(|| read("/usr/share/omarchy/themes")).unwrap_or_default();
+                (txt, n.clone())
+            }
+            None => (
+                fs::read_to_string(format!("{base}/theme/colors.toml")).unwrap_or_default(),
+                fs::read_to_string(format!("{base}/theme.name")).unwrap_or_default(),
+            ),
+        };
         let mut m: HashMap<String, String> = [
             ("background", "#1a1b26"), ("dark_background", "#13141c"), ("selection", "#292e42"),
             ("muted", "#414868"), ("accent", "#7aa2f7"), ("foreground", "#a9b1d6"),

@@ -58,7 +58,7 @@ fn wrap(l: Layer) -> Option<LayerTex> {
 }
 
 fn bake_all(g: &mut RealGpu, v: &View, ds: f64) {
-    let ly = scene::bake(v.tank, ds);
+    let ly = scene::bake(v.tank, ds, &scene::Water::from(v.pal));
     g.far = wrap(ly.far);
     g.rays = wrap(ly.rays);
     g.rocks = wrap(ly.rocks);
@@ -106,7 +106,8 @@ pub fn render(widget: &gtk::Widget, snap: &gtk::Snapshot, v: &View, cache: &mut 
     let full = rect(0.0, 0.0, w, h);
 
     // 1. Agua.
-    let ws: Vec<_> = scene::water_stops(b).iter().map(|&(o, c)| (o as f32, c, 1.0)).collect();
+    let wt = scene::Water::from(v.pal);
+    let ws: Vec<_> = wt.stops(b).iter().map(|&(o, c)| (o as f32, c, 1.0)).collect();
     snap.append_linear_gradient(&full, &pt(0.0, 0.0), &pt(0.0, h), &stops(&ws));
 
     // 2. Arrecife lejano y rayos de luz.
@@ -183,14 +184,14 @@ pub fn render(widget: &gtk::Widget, snap: &gtk::Snapshot, v: &View, cache: &mut 
         &full,
         &pt(0.0, 0.0),
         &pt(0.0, h),
-        &stops(&[(0.0, scene::WATER_TOP, 0.0), (0.6, scene::WATER_BOT, 0.10), (1.0, scene::WATER_BOT, 0.36)]),
+        &stops(&[(0.0, wt.top, 0.0), (0.6, wt.bot, 0.10), (1.0, wt.bot, 0.36)]),
     );
 
     // 8. Superficie (franja fina que se repinta cada fotograma).
     {
         let strip = t.surface_y() + 34.0 * t.scale();
         let cr = snap.append_cairo(&rect(0.0, 0.0, w, strip));
-        scene::surface(&cr, t);
+        scene::surface(&cr, t, &wt);
     }
 
     // 9. Turbidez, calor y cristal.

@@ -710,7 +710,7 @@ pub(crate) struct FishArt {
 /// Dibuja un pez completo mirando a +x y centrado en el origen, sin transformaciones ni alfa.
 fn paint_fish(cr: &Context, a: &FishArt, pal: &Palette) {
     if a.style == Style::Realistic {
-        crate::reef::fish::paint(cr, a);
+        crate::reef::fish::paint(cr, a, pal);
         return;
     }
     let def = &SPECIES_DEFS[a.look.species];

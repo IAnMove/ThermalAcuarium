@@ -59,7 +59,7 @@ fn spline_closed(cr: &Context, pts: &[(f64, f64)]) {
     cr.close_path();
 }
 
-pub fn paint(cr: &Context, a: &FishArt) {
+pub fn paint(cr: &Context, a: &FishArt, pal: &crate::theme::Palette) {
     let s = &SPECIES[a.look.real];
     let len = a.len;
     let hh = s.ratio * len;
@@ -74,7 +74,10 @@ pub fn paint(cr: &Context, a: &FishArt) {
 
     // Pequeña variación de tono por pez; apagado si está muerto.
     let tint = a.look.tint * 0.07;
+    // El agua del tema (ver `Water`) tiñe un poco a los peces, sin cambiar de especie ni de color base.
+    let amb = super::scene::Water::from(pal).top;
     let adj = |c: Rgb| {
+        let c = mix(c, amb, 0.10);
         let c = if tint > 0.0 { lighten(c, tint) } else { darken(c, -tint) };
         if a.dying { darken(desat(c, 0.6), 0.12) } else { c }
     };

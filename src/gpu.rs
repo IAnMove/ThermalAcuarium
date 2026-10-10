@@ -209,6 +209,10 @@ pub fn render(widget: &gtk::Widget, snap: &gtk::Snapshot, v: &View, cache: &mut 
         cache.style = Some(v.style);
     }
     if cache.pal != v.pal.raw || (cache.ds - ds).abs() > 0.01 || cache.size != size {
+        if cache.pal != v.pal.raw {
+            // Otro tema de Omarchy: el agua, la arena y los peces del estilo realista se recalculan.
+            cache.real.clear();
+        }
         cache.sprites.clear();
         cache.bytes = 0;
         cache.rays = None;

@@ -11,22 +11,61 @@ use gtk::cairo::{self, Context, ImageSurface, RadialGradient};
 
 use super::noise;
 use crate::draw::{Quiet, View, closed_smooth, lin, rgba};
-use crate::sim::{BubbleKind, Pick, Tank, unit};
-use crate::theme::{Rgb, darken, lighten, mix};
+use crate::sim::{BubbleKind, Pick, Tank, hash_str, unit};
+use crate::theme::{Palette, Rgb, darken, lighten, luma, mix, tone};
 
 // ---------------------------------------------------------------- colores del agua
 
-pub const WATER_TOP: Rgb = (0.12, 0.52, 0.66);
-pub const WATER_MID: Rgb = (0.03, 0.26, 0.45);
-pub const WATER_BOT: Rgb = (0.005, 0.055, 0.14);
+/// Colores del agua derivados del tema activo de Omarchy: el matiz sale de su azul/cian, la
+/// luminosidad de si el tema es oscuro (acuario de noche) o claro (de día).
+#[derive(Clone, Copy)]
+pub struct Water {
+    pub top: Rgb,
+    pub mid: Rgb,
+    pub bot: Rgb,
+    /// Tono oscuro para viñeta, bordes del cristal y siluetas del fondo.
+    pub abyss: Rgb,
+    /// Aire por encima de la superficie.
+    pub air: Rgb,
+    pub ray: Rgb,
+    pub far1: Rgb,
+    pub far2: Rgb,
+    pub dark: bool,
+}
 
-/// Degradado del agua de arriba abajo; con calor se vuelve ámbar, sobre todo en el fondo.
-pub fn water_stops(boil: f64) -> [(f64, Rgb); 3] {
-    [
-        (0.0, mix(WATER_TOP, (0.55, 0.46, 0.30), 0.18 * boil)),
-        (0.38, mix(WATER_MID, (0.36, 0.20, 0.12), 0.30 * boil)),
-        (1.0, mix(WATER_BOT, (0.36, 0.08, 0.03), 0.60 * boil)),
-    ]
+/// Realza la saturación: los temas apagados (nord, gruvbox…) dan un agua demasiado gris si no.
+fn boost(c: Rgb, k: f64) -> Rgb {
+    let l = luma(c);
+    ((l + (c.0 - l) * k).clamp(0.0, 1.0), (l + (c.1 - l) * k).clamp(0.0, 1.0), (l + (c.2 - l) * k).clamp(0.0, 1.0))
+}
+
+impl Water {
+    pub fn from(p: &Palette) -> Water {
+        let natural = (0.10, 0.50, 0.62);
+        let hue = mix(natural, boost(mix(p.blue, p.cyan, 0.5), 1.3), 0.75);
+        let dark = p.dark;
+        let (lt, lm, lb) = if dark { (0.44, 0.22, 0.05) } else { (0.66, 0.48, 0.28) };
+        Water {
+            top: tone(hue, lt),
+            mid: tone(hue, lm),
+            bot: tone(mix(hue, p.dbg, 0.35), lb),
+            abyss: tone(hue, if dark { 0.02 } else { 0.12 }),
+            air: if dark { darken(p.dbg, 0.45) } else { p.bg },
+            ray: lighten(tone(hue, lt), 0.7),
+            far1: tone(hue, if dark { 0.10 } else { 0.40 }),
+            far2: tone(hue, if dark { 0.045 } else { 0.30 }),
+            dark,
+        }
+    }
+
+    /// Degradado del agua de arriba abajo; con calor se vuelve ámbar, sobre todo en el fondo.
+    pub fn stops(&self, boil: f64) -> [(f64, Rgb); 3] {
+        [
+            (0.0, mix(self.top, (0.55, 0.46, 0.30), 0.18 * boil)),
+            (0.38, mix(self.mid, (0.36, 0.20, 0.12), 0.30 * boil)),
+            (1.0, mix(self.bot, (0.36, 0.08, 0.03), 0.60 * boil)),
+        ]
+    }
 }
 
 // ---------------------------------------------------------------- capas
@@ -63,27 +102,27 @@ fn layer(x: f64, y: f64, w: f64, h: f64, ds: f64, q: f64, paint: impl FnOnce(&Co
     Layer { surf, x, y, w, h }
 }
 
-pub fn bake(t: &Tank, ds: f64) -> Layers {
+pub fn bake(t: &Tank, ds: f64, wt: &Water) -> Layers {
     let (w, h) = (t.w, t.h);
     let grain = noise::grey_tile(256, 40, 2, 99, 1.6);
     let rough = noise::grey_tile(256, 8, 4, 7, 1.8);
     Layers {
-        far: layer(0.0, 0.0, w, h, ds, 0.18, |cr| paint_far(cr, w, h)),
-        rays: layer(0.0, 0.0, w, h, ds, 0.25, |cr| paint_rays(cr, w, h)),
-        rocks: layer(0.0, 0.0, w, h, ds, 1.0, |cr| paint_rocks(cr, t, &rough)),
+        far: layer(0.0, 0.0, w, h, ds, 0.18, |cr| paint_far(cr, w, h, wt)),
+        rays: layer(0.0, 0.0, w, h, ds, 0.25, |cr| paint_rays(cr, w, h, wt)),
+        rocks: layer(0.0, 0.0, w, h, ds, 1.0, |cr| paint_rocks(cr, t, &rough, wt)),
         sand: {
             let y0 = (h * 0.88).floor();
-            layer(0.0, y0, w, h - y0, ds, 1.0, |cr| paint_sand(cr, t, &grain))
+            layer(0.0, y0, w, h - y0, ds, 1.0, |cr| paint_sand(cr, t, &grain, wt))
         },
-        glass: layer(0.0, 0.0, w, h, ds, 0.5, |cr| paint_glass(cr, w, h)),
+        glass: layer(0.0, 0.0, w, h, ds, 0.5, |cr| paint_glass(cr, w, h, wt)),
         caustic: noise::caustic_tile(256, 31),
     }
 }
 
 /// Reflejo de la pared del fondo del acuario: siluetas de arrecife desenfocadas (la capa se pinta
 /// a baja resolución, el escalado hace de desenfoque).
-fn paint_far(cr: &Context, w: f64, h: f64) {
-    for (base, amp, col, a, seed) in [(0.62, 0.26, (0.04, 0.20, 0.34), 0.50, 11u32), (0.80, 0.34, (0.02, 0.10, 0.19), 0.66, 23)] {
+fn paint_far(cr: &Context, w: f64, h: f64, wt: &Water) {
+    for (base, amp, col, a, seed) in [(0.62, 0.26, wt.far1, 0.50, 11u32), (0.80, 0.34, wt.far2, 0.66, 23)] {
         cr.move_to(0.0, h);
         let mut x = 0.0;
         while x <= w + 4.0 {
@@ -106,8 +145,8 @@ fn paint_far(cr: &Context, w: f64, h: f64) {
 }
 
 /// Haces de luz que bajan desde la superficie.
-fn paint_rays(cr: &Context, w: f64, h: f64) {
-    let col = (0.75, 0.95, 1.0);
+fn paint_rays(cr: &Context, w: f64, h: f64, wt: &Water) {
+    let col = wt.ray;
     for i in 0..9 {
         let x0 = w * (0.02 + 0.115 * i as f64) + w * 0.03 * (i as f64 * 2.1).sin();
         let bw = w * (0.012 + 0.018 * unit(i as u64 + 5));
@@ -125,7 +164,7 @@ fn paint_rays(cr: &Context, w: f64, h: f64) {
 }
 
 /// Roca viva: pilas de rocas con algas coralinas, grietas y luz desde arriba.
-fn paint_rocks(cr: &Context, t: &Tank, rough: &ImageSurface) {
+fn paint_rocks(cr: &Context, t: &Tank, rough: &ImageSurface, wt: &Water) {
     let (w, h) = (t.w, t.h);
     // (centro x, ancho, alto) relativos; las pilas de los lados enmarcan la escena.
     let spec: [(f64, f64, f64); 9] = [
@@ -146,7 +185,7 @@ fn paint_rocks(cr: &Context, t: &Tank, rough: &ImageSurface) {
     }
     // Todo está bajo el agua: tiñe de azul lo ya pintado (solo donde hay roca).
     cr.set_operator(cairo::Operator::Atop);
-    let _ = cr.set_source(lin(0.0, 0.0, 0.0, h, &[(0.0, WATER_TOP, 0.20), (1.0, WATER_BOT, 0.50)]));
+    let _ = cr.set_source(lin(0.0, 0.0, 0.0, h, &[(0.0, wt.top, 0.20), (1.0, wt.bot, 0.50)]));
     cr.rectangle(0.0, 0.0, w, h);
     cr.fill_q();
     cr.set_operator(cairo::Operator::Over);
@@ -223,7 +262,7 @@ pub(crate) fn rock(cr: &Context, cx: f64, base: f64, w: f64, h: f64, seed: u64, 
 }
 
 /// Arena de aragonito con granos, guijarros, conchas y ondulaciones.
-fn paint_sand(cr: &Context, t: &Tank, grain: &ImageSurface) {
+fn paint_sand(cr: &Context, t: &Tank, grain: &ImageSurface, wt: &Water) {
     let (w, h) = (t.w, t.h);
     let y0 = (h * 0.88).floor();
     cr.move_to(0.0, h);
@@ -294,7 +333,7 @@ fn paint_sand(cr: &Context, t: &Tank, grain: &ImageSurface) {
         cr.fill_q();
     }
     // Está bajo el agua: tinte azul y oscurecimiento hacia el fondo.
-    let _ = cr.set_source(lin(0.0, y0, 0.0, h, &[(0.0, WATER_MID, 0.22), (1.0, WATER_BOT, 0.50)]));
+    let _ = cr.set_source(lin(0.0, y0, 0.0, h, &[(0.0, wt.mid, 0.22), (1.0, wt.bot, 0.50)]));
     let _ = cr.paint();
     cr.restore_q();
     // Borde de la arena contra el agua.
@@ -311,9 +350,11 @@ fn paint_sand(cr: &Context, t: &Tank, grain: &ImageSurface) {
 }
 
 /// Cristal y marco: reflejos, bordes que refractan, sombra de la tapa y brillo de la luminaria.
-fn paint_glass(cr: &Context, w: f64, h: f64) {
+fn paint_glass(cr: &Context, w: f64, h: f64, wt: &Water) {
+    let ab = wt.abyss;
+    let k = if wt.dark { 1.0 } else { 0.55 };
     // Sombra de la tapa con el foco de luz de la luminaria.
-    let _ = cr.set_source(lin(0.0, 0.0, 0.0, h * 0.10, &[(0.0, (0.0, 0.01, 0.03), 0.55), (1.0, (0.0, 0.01, 0.03), 0.0)]));
+    let _ = cr.set_source(lin(0.0, 0.0, 0.0, h * 0.10, &[(0.0, ab, 0.55 * k), (1.0, ab, 0.0)]));
     cr.rectangle(0.0, 0.0, w, h * 0.10);
     cr.fill_q();
     let g = RadialGradient::new(w * 0.5, 0.0, 0.0, w * 0.5, 0.0, w * 0.55);
@@ -324,7 +365,7 @@ fn paint_glass(cr: &Context, w: f64, h: f64) {
     cr.fill_q();
     // Bordes laterales: el cristal grueso oscurece y refracta.
     for (x0, x1) in [(0.0, w * 0.05), (w, w * 0.95)] {
-        let _ = cr.set_source(lin(x0, 0.0, x1, 0.0, &[(0.0, (0.0, 0.02, 0.05), 0.55), (1.0, (0.0, 0.02, 0.05), 0.0)]));
+        let _ = cr.set_source(lin(x0, 0.0, x1, 0.0, &[(0.0, ab, 0.55 * k), (1.0, ab, 0.0)]));
         cr.rectangle(0.0f64.min(x0).min(x1), 0.0, (x1 - x0).abs(), h);
         cr.fill_q();
     }
@@ -348,7 +389,7 @@ fn paint_glass(cr: &Context, w: f64, h: f64) {
     // Viñeta general.
     let g = RadialGradient::new(w / 2.0, h / 2.0, w.min(h) * 0.38, w / 2.0, h / 2.0, w.max(h) * 0.78);
     g.add_color_stop_rgba(0.0, 0.0, 0.0, 0.0, 0.0);
-    g.add_color_stop_rgba(1.0, 0.0, 0.02, 0.05, 0.50);
+    g.add_color_stop_rgba(1.0, ab.0, ab.1, ab.2, 0.50 * k);
     let _ = cr.set_source(&g);
     cr.rectangle(0.0, 0.0, w, h);
     cr.fill_q();
@@ -357,18 +398,18 @@ fn paint_glass(cr: &Context, w: f64, h: f64) {
 // ---------------------------------------------------------------- renderizador Cairo (referencia)
 
 thread_local! {
-    static LAYERS: RefCell<Option<((i32, i32, i32), Rc<Layers>)>> = const { RefCell::new(None) };
+    static LAYERS: RefCell<Option<((i32, i32, i32, u64), Rc<Layers>)>> = const { RefCell::new(None) };
 }
 
-fn layers(t: &Tank, ds: f64) -> Rc<Layers> {
-    let key = (t.w as i32, t.h as i32, (ds * 100.0) as i32);
+fn layers(t: &Tank, ds: f64, wt: &Water, pal_key: u64) -> Rc<Layers> {
+    let key = (t.w as i32, t.h as i32, (ds * 100.0) as i32, pal_key);
     LAYERS.with(|c| {
         let mut c = c.borrow_mut();
         if let Some((k, l)) = c.as_ref()
             && *k == key {
                 return l.clone();
             }
-        let l = Rc::new(bake(t, ds));
+        let l = Rc::new(bake(t, ds, wt));
         *c = Some((key, l.clone()));
         l
     })
@@ -415,10 +456,11 @@ pub fn caustics(cr: &Context, ly: &Layers, t: &Tank) {
 pub fn draw_tank(cr: &Context, v: &View) {
     let t = v.tank;
     let ds = cr.target().device_scale().0.max(1.0);
-    let ly = layers(t, ds);
+    let wt = Water::from(v.pal);
+    let ly = layers(t, ds, &wt, hash_str(&v.pal.raw));
     crate::draw::reset_budget();
 
-    let stops: Vec<_> = water_stops(t.boil).iter().map(|&(o, c)| (o, c, 1.0)).collect();
+    let stops: Vec<_> = wt.stops(t.boil).iter().map(|&(o, c)| (o, c, 1.0)).collect();
     let _ = cr.set_source(lin(0.0, 0.0, 0.0, t.h, &stops));
     cr.rectangle(0.0, 0.0, t.w, t.h);
     cr.fill_q();
@@ -448,11 +490,11 @@ pub fn draw_tank(cr: &Context, v: &View) {
     bubbles(cr, t, ds);
 
     // Atenuación con la profundidad: la luz baja de arriba y el agua absorbe.
-    let _ = cr.set_source(lin(0.0, 0.0, 0.0, t.h, &[(0.0, WATER_TOP, 0.0), (0.6, WATER_BOT, 0.10), (1.0, WATER_BOT, 0.36)]));
+    let _ = cr.set_source(lin(0.0, 0.0, 0.0, t.h, &[(0.0, wt.top, 0.0), (0.6, wt.bot, 0.10), (1.0, wt.bot, 0.36)]));
     cr.rectangle(0.0, 0.0, t.w, t.h);
     cr.fill_q();
 
-    surface(cr, t);
+    surface(cr, t, &wt);
     overlays(cr, v);
     draw_layer(cr, &ly.glass, 1.0);
     crate::draw::labels(cr, v);
@@ -597,13 +639,13 @@ fn bubbles(cr: &Context, t: &Tank, ds: f64) {
 
 /// Superficie vista desde el lateral: el aire arriba, un menisco brillante y la franja plateada
 /// justo debajo, donde el agua refleja el interior del acuario.
-pub fn surface(cr: &Context, t: &Tank) {
+pub fn surface(cr: &Context, t: &Tank, wt: &Water) {
     use crate::draw::{surface_at, surface_path};
     surface_path(cr, t);
     cr.line_to(t.w, 0.0);
     cr.line_to(0.0, 0.0);
     cr.close_path();
-    let _ = cr.set_source(lin(0.0, 0.0, 0.0, t.surface_y() + 10.0, &[(0.0, (0.0, 0.01, 0.03), 1.0), (1.0, (0.02, 0.07, 0.12), 1.0)]));
+    let _ = cr.set_source(lin(0.0, 0.0, 0.0, t.surface_y() + 10.0, &[(0.0, wt.air, 1.0), (1.0, mix(wt.air, wt.mid, 0.35), 1.0)]));
     cr.fill_q();
     // Franja plateada bajo el menisco (reflexión total).
     let sy = t.surface_y();
@@ -670,7 +712,7 @@ pub fn gallery(cr: &Context, w: f64, h: f64, len: f64, font: &str, pal: &crate::
         let art = FishArt { look, len, phase: 1.3, amp: 0.6, dying: false, style: Style::Realistic };
         cr.save_q();
         cr.translate(cx, cy);
-        super::fish::paint(cr, &art);
+        super::fish::paint(cr, &art, pal);
         cr.restore_q();
         let name = super::species::SPECIES[i].name;
         rgba(cr, (1.0, 1.0, 1.0), 0.9);
@@ -689,7 +731,7 @@ mod tests {
     fn bake_layers_is_fast_enough() {
         let t = Tank::new(1180.0, 680.0, 1);
         let start = std::time::Instant::now();
-        let ly = bake(&t, 1.0);
+        let ly = bake(&t, 1.0, &Water::from(&Palette::load()));
         let ms = start.elapsed().as_millis();
         eprintln!("bake 1180x680 @1x: {ms} ms");
         assert!(ms < 1500, "bake tardó {ms} ms");

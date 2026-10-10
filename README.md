@@ -33,8 +33,12 @@ Press **`T`** (or click the style button in the header) to switch; the choice is
   kelp, sea fans, brain coral and bubble‑tip anemones for the protected processes. Boiling water
   turns amber with glassy bubbles.
 
-The realistic style is naturalistic, not photographic, and it deliberately does **not** follow the
-Omarchy palette (a clownfish is orange); only the window chrome and dialogs do.
+The realistic style is naturalistic, not photographic. It **reads the active Omarchy theme** and adapts
+to it: the water, light shafts, reef wall, rocks, sand tint, glass and air take their hue from the theme's
+blue/cyan, dark themes give a night tank and light themes (catppuccin-latte, flexoki-light, white…) a
+bright daytime tank, and fish get a faint tint of that water. Species keep their natural colors (a
+clownfish is still orange). It hot‑reloads when you run `omarchy theme set …`; try other themes without
+changing yours with `thermalacuarium --theme gruvbox`.
 
 ## Use
 
@@ -74,6 +78,7 @@ thermalacuarium --temp 95          # force the water temperature to preview the 
 THERMALACUARIUM_LANG=es thermalacuarium
 thermalacuarium --snapshot out.png [--style real] [--size 1180x680] [--seconds 8] [--temp 99] [--demo] [--dying 3] [--names 1] [--hover 600,300] [--bench]
 thermalacuarium --snapshot gallery.png --gallery --style real --len 210   # all species
+thermalacuarium --theme nord       # preview another Omarchy theme (or THERMALACUARIUM_THEME=nord)
 thermalacuarium --new-instance     # open another window without activating the running one
 ```
 
