@@ -24,4 +24,10 @@ Categories=System;Monitor;
 StartupWMClass=dev.ina.thermalacuarium
 EOF
 
+# Opcional: también el widget de la barra de Omarchy (pide confirmación: instala un plugin de git).
+if [ "${1:-}" = "--plugin" ]; then
+    echo "==> Adding the Omarchy bar widget..."
+    omarchy plugin add https://github.com/IAnMove/ThermalAcuarium --enable
+fi
+
 echo "=== Done! Run: thermalacuarium ==="

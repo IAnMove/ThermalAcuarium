@@ -86,7 +86,18 @@ fn theme_override() -> Option<String> {
     a.iter().position(|x| x == "--theme").and_then(|i| a.get(i + 1).cloned()).or_else(|| std::env::var("THERMALACUARIUM_THEME").ok())
 }
 
+/// Carpeta donde Omarchy guarda el tema activo (`omarchy theme set` la reescribe).
+pub fn omarchy_current_dir() -> String {
+    format!("{}/.local/state/omarchy/current", std::env::var("HOME").unwrap_or_default())
+}
+
 impl Palette {
+    /// ¿Hay ahora mismo una paleta legible? Mientras Omarchy cambia de tema, la carpeta del tema
+    /// desaparece un instante: en ese caso se conserva la paleta anterior en vez de caer a la de serie.
+    pub fn available() -> bool {
+        theme_override().is_some() || fs::metadata(format!("{}/theme/colors.toml", omarchy_current_dir())).is_ok()
+    }
+
     pub fn load() -> Self {
         let home = std::env::var("HOME").unwrap_or_default();
         let base = format!("{home}/.local/state/omarchy/current");

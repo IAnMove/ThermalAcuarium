@@ -512,10 +512,10 @@ pub(crate) fn labels(snap: &gtk::Snapshot, widget: &gtk::Widget, v: &View) {
     for n in &plan.names {
         let l = text(widget, &n.text, v.font, fs);
         let (tw, _) = l.pixel_size();
-        put_text(snap, &l, n.x - tw as f64 / 2.0, n.y, lighten(p.bfg, 0.1));
+        put_text(snap, &l, n.x - tw as f64 / 2.0, n.y, draw::label_color(p));
     }
     if let Some(hid) = &plan.hidden {
-        put_text(snap, &text(widget, hid, v.font, fs), 12.0, t.h - 12.0, p.dfg);
+        put_text(snap, &text(widget, hid, v.font, fs), 12.0, t.h - 12.0, mix(draw::label_color(p), (0.5, 0.6, 0.7), 0.35));
     }
     if plan.paused {
         let l = text(widget, crate::i18n::tr("paused"), v.font, fs + 3.0);

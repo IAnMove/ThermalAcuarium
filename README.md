@@ -37,7 +37,7 @@ The realistic style is naturalistic, not photographic. It **reads the active Oma
 to it: the water, light shafts, reef wall, rocks, sand tint, glass and air take their hue from the theme's
 blue/cyan, dark themes give a night tank and light themes (catppuccin-latte, flexoki-light, white…) a
 bright daytime tank, and fish get a faint tint of that water. Species keep their natural colors (a
-clownfish is still orange). It hot‑reloads when you run `omarchy theme set …`; try other themes without
+clownfish is still orange). It follows theme changes live (it watches Omarchy's theme folder: run `omarchy theme set …` and the window and the tank recolor within a second, no restart); try other themes without
 changing yours with `thermalacuarium --theme gruvbox`.
 
 ## Use
@@ -55,9 +55,16 @@ Only processes of your own user are shown. The tank holds the 180 biggest.
 ### As an Omarchy shell plugin (bar widget)
 
 ```bash
-./install.sh   # first install the app (builds it and puts it in ~/.local/bin)
+git clone https://github.com/IAnMove/ThermalAcuarium && cd ThermalAcuarium
+./install.sh --plugin    # builds the app, installs it, and adds + enables the bar widget
+```
+
+or step by step (the widget needs the app installed first):
+
+```bash
+./install.sh
 omarchy plugin add https://github.com/IAnMove/ThermalAcuarium --enable
-omarchy bar move io.github.ianmove.thermalacuarium --section right
+omarchy bar move io.github.ianmove.thermalacuarium --section right   # left | center | right
 ```
 
 The widget shows the CPU temperature (🐠, or 🫧 when the water would be boiling); click it to open the

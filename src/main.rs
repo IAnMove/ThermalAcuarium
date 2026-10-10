@@ -145,6 +145,38 @@ fn style_name(s: Style) -> &'static str {
     }
 }
 
+/// Vigila la carpeta del tema de Omarchy: al ejecutar `omarchy theme set …` el acuario se
+/// recolorea al instante (los monitores se vuelven a armar porque Omarchy reemplaza la carpeta
+/// `theme` entera y el monitor de la antigua quedaría huérfano).
+fn watch_theme(ui: &Rc<Ui>) {
+    let monitors: Rc<RefCell<Vec<gio::FileMonitor>>> = Rc::new(RefCell::new(vec![]));
+    let pending = Rc::new(std::cell::Cell::new(false));
+    fn arm(ui: &Rc<Ui>, monitors: &Rc<RefCell<Vec<gio::FileMonitor>>>, pending: &Rc<std::cell::Cell<bool>>) {
+        let cur = theme::omarchy_current_dir();
+        let mut v = vec![];
+        for dir in [cur.clone(), format!("{cur}/theme")] {
+            let Ok(mon) = gio::File::for_path(&dir).monitor_directory(gio::FileMonitorFlags::NONE, gio::Cancellable::NONE) else { continue };
+            let (u, mons, pend) = (ui.clone(), monitors.clone(), pending.clone());
+            mon.connect_changed(move |_, _, _, _| {
+                if pend.replace(true) {
+                    return; // ya hay una recarga en camino: los eventos llegan en ráfaga
+                }
+                let (u, mons, pend) = (u.clone(), mons.clone(), pend.clone());
+                glib::timeout_add_local_once(Duration::from_millis(400), move || {
+                    pend.set(false);
+                    apply_theme(&u, false);
+                    arm(&u, &mons, &pend);
+                });
+            });
+            v.push(mon);
+        }
+        *monitors.borrow_mut() = v;
+    }
+    arm(ui, &monitors, &pending);
+    // La referencia vive mientras viva la aplicación.
+    std::mem::forget(monitors);
+}
+
 /// Cambia entre el estilo estilizado y el realista y recuerda la elección.
 fn toggle_style(ui: &Rc<Ui>) {
     let s = {
@@ -175,15 +207,18 @@ fn show_about(ui: &Rc<Ui>) {
 }
 
 fn apply_theme(ui: &Rc<Ui>, force: bool) {
-    let new = Palette::load();
-    {
-        let m = ui.m.borrow();
-        if !force && m.pal.raw == new.raw {
-            return;
-        }
-        #[allow(deprecated)]
-        ui.provider.load_from_data(&new.css(&m.font));
+    if !Palette::available() {
+        return; // Omarchy está en mitad de un cambio de tema
     }
+    let new = Palette::load();
+    if !force && ui.m.borrow().pal.raw == new.raw {
+        return;
+    }
+    // Un tema nuevo puede traer otra fuente: se vuelve a preguntar solo cuando cambia.
+    let font = if force { ui.m.borrow().font.clone() } else { current_font() };
+    #[allow(deprecated)]
+    ui.provider.load_from_data(&new.css(&font));
+    ui.m.borrow_mut().font = font;
     adw::StyleManager::default().set_color_scheme(if new.dark {
         adw::ColorScheme::ForceDark
     } else {
@@ -448,8 +483,10 @@ fn build_ui(app: &adw::Application) {
         sample_procs(&u);
         glib::ControlFlow::Continue
     });
+    // Respaldo por si el sistema de archivos no avisa (p. ej. temas editados desde fuera).
+    watch_theme(&ui);
     let u = ui.clone();
-    glib::timeout_add_seconds_local(6, move || {
+    glib::timeout_add_seconds_local(10, move || {
         apply_theme(&u, false);
         glib::ControlFlow::Continue
     });

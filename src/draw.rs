@@ -1295,6 +1295,12 @@ fn layer(key: String, w: f64, h: f64, paint: impl FnOnce(&Context)) -> Option<ca
 
 // ---------------------------------------------------------------- textos
 
+/// Color de los textos que van sobre el agua: claro siempre (aunque el tema sea claro, el agua es
+/// azul medio) con sombra oscura.
+pub(crate) fn label_color(p: &Palette) -> Rgb {
+    if luma(p.bfg) < 0.55 { (0.96, 0.98, 1.0) } else { lighten(p.bfg, 0.1) }
+}
+
 pub(crate) fn text_at(cr: &Context, txt: &str, x: f64, y: f64, col: Rgb) {
     rgba(cr, (0.0, 0.0, 0.0), 0.6);
     cr.move_to(x + 1.0, y + 1.0);
@@ -1405,11 +1411,11 @@ pub(crate) fn labels(cr: &Context, v: &View) {
     cr.set_font_size(fs);
     for n in &plan.names {
         if let Ok(e) = cr.text_extents(&n.text) {
-            text_at(cr, &n.text, n.x - e.width() / 2.0, n.y, lighten(p.bfg, 0.1));
+            text_at(cr, &n.text, n.x - e.width() / 2.0, n.y, label_color(p));
         }
     }
     if let Some(h) = &plan.hidden {
-        text_at(cr, h, 12.0, t.h - 12.0, p.dfg);
+        text_at(cr, h, 12.0, t.h - 12.0, mix(label_color(p), (0.5, 0.6, 0.7), 0.35));
     }
     if plan.paused {
         cr.set_font_size(fs + 3.0);
