@@ -17,6 +17,26 @@ window.ta headerbar windowcontrols button { color: @ta_fg; }
 button.stylebtn { color: @ta_accent; font-size: 10px; font-weight: 800; letter-spacing: 2px; border-radius: 0;
                   min-height: 0; padding: 2px 10px; box-shadow: none; }
 button.stylebtn:hover { background: @ta_sel; }
+.tabs button { background: transparent; color: @ta_dfg; border: 1px solid @ta_muted; border-radius: 0;
+               min-height: 0; padding: 2px 14px; font-size: 11px; font-weight: 700; box-shadow: none; letter-spacing: 1px; }
+.tabs button:checked { background: @ta_accent; color: @ta_bg; border-color: @ta_accent; }
+.card { background: @ta_dbg; border: 1px solid @ta_muted; border-radius: 0; padding: 8px 10px; }
+.cardlabel { color: @ta_dfg; font-size: 10px; font-weight: 800; letter-spacing: 2px; }
+.cardvalue { color: @ta_bfg; font-size: 22px; font-weight: 800; }
+.cardsub { color: @ta_dfg; font-size: 10px; }
+.tablehead button.colhead { color: @ta_dfg; font-size: 10px; font-weight: 800; letter-spacing: 1px; padding: 2px 4px; min-height: 0; border-radius: 0; }
+.proclist { background: transparent; }
+.proclist row { background: transparent; padding: 0; }
+.procrow { background: @ta_dbg; border: 1px solid @ta_muted; border-radius: 0; padding: 5px 10px; margin: 2px 0; }
+.procname { color: @ta_bfg; font-weight: 700; }
+.procmeta { color: @ta_fg; font-size: 11px; }
+button.closebtn { background: transparent; color: @ta_red; border: 1px solid @ta_red; border-radius: 0;
+                  padding: 1px 8px; min-height: 0; font-size: 10px; font-weight: 700; box-shadow: none; }
+button.closebtn:hover { background: @ta_red; color: @ta_bg; }
+button.closebtn:disabled { color: @ta_muted; border-color: @ta_muted; }
+progressbar trough { min-height: 3px; border-radius: 0; background: @ta_sel; border: none; }
+progressbar progress { min-height: 3px; border-radius: 0; background: @ta_accent; border: none; }
+searchentry { border-radius: 0; }
 "#;
 
 pub fn parse_hex(s: &str) -> Rgb {
@@ -180,6 +200,19 @@ impl Palette {
     }
 }
 
+/// Modo de la ventana: arcade (la pecera) u oficina (tablas). Se recuerda junto al estilo.
+pub fn load_office() -> bool {
+    fs::read_to_string(Style::file().with_file_name("mode")).map(|s| s.trim() == "office").unwrap_or(false)
+}
+
+pub fn save_office(office: bool) {
+    let f = Style::file().with_file_name("mode");
+    if let Some(dir) = f.parent() {
+        let _ = fs::create_dir_all(dir);
+    }
+    let _ = fs::write(f, if office { "office" } else { "arcade" });
+}
+
 pub fn current_font() -> String {
     std::process::Command::new("omarchy")
         .args(["font", "current"])
@@ -230,7 +263,7 @@ impl Style {
         }
     }
 
-    fn file() -> std::path::PathBuf {
+    pub(crate) fn file() -> std::path::PathBuf {
         let home = std::env::var("HOME").unwrap_or_default();
         let base = std::env::var("XDG_CONFIG_HOME").unwrap_or_else(|_| format!("{home}/.config"));
         std::path::PathBuf::from(base).join("thermalacuarium").join("style")

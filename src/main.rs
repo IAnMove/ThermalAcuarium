@@ -5,6 +5,7 @@
 mod draw;
 mod gpu;
 mod i18n;
+mod office;
 mod pixel;
 mod reef;
 mod sonar;
@@ -23,7 +24,7 @@ use gtk::{gdk, gio, glib};
 use draw::View;
 use i18n::{tr, trf};
 use sim::{Pick, Tank};
-use sys::{ProcSampler, Sensors, SysSampler, comm_of, fmt_bytes};
+use sys::{Group, ProcSampler, Sensors, SysSampler, comm_of, fmt_bytes};
 use theme::{Palette, Rgb, Style, current_font, to_hex};
 
 const APP_ID: &str = "dev.ina.thermalacuarium";
@@ -76,6 +77,9 @@ struct Model {
     first_sync: bool,
     gpu: gpu::GpuCache,
     style: Style,
+    /// Última muestra de procesos (para la tabla y para cerrar grupos).
+    groups: Vec<Group>,
+    office: bool,
 }
 
 struct Chips {
@@ -94,6 +98,9 @@ struct Ui {
     provider: gtk::CssProvider,
     chips: Chips,
     style_btn: gtk::Button,
+    mode_btn: gtk::Button,
+    pages: gtk::Stack,
+    office: Rc<office::Office>,
 }
 
 fn chip(pal: &Palette, key: &str, val: &str, vcol: Option<Rgb>) -> String {
@@ -115,6 +122,7 @@ fn update_sensors(ui: &Rc<Ui>) {
     let s = m.sys.sample();
     let temp = demo_temp().or(r.cpu);
     m.tank.set_env(temp, r.load / ncpu(), s.ram_used, s.ram_total, s.disk_w);
+    ui.office.refresh_perf(&s, &r, temp);
 
     let pal = &m.pal;
     let f = |v: Option<f64>| v.map_or("--".to_string(), |v| format!("{v:.0}°"));
@@ -138,6 +146,60 @@ fn sample_procs(ui: &Rc<Ui>) {
     let first = m.first_sync;
     m.first_sync = false;
     m.tank.sync(&groups, first);
+    let ram_total = m.tank.ram_total;
+    m.groups = groups;
+    if m.office {
+        ui.office.refresh_procs(&m.groups, ram_total);
+    }
+}
+
+fn mode_name(office: bool) -> &'static str {
+    if office { tr("mode_arcade") } else { tr("mode_office") }
+}
+
+/// Cambia entre la pecera y el administrador de tareas.
+fn toggle_mode(ui: &Rc<Ui>) {
+    let office = {
+        let mut m = ui.m.borrow_mut();
+        m.office = !m.office;
+        theme::save_office(m.office);
+        m.office
+    };
+    ui.pages.set_visible_child_name(if office { "office" } else { "tank" });
+    ui.mode_btn.set_label(mode_name(office));
+    ui.style_btn.set_visible(!office);
+    if office {
+        let (groups, rt) = {
+            let m = ui.m.borrow();
+            (m.groups.clone(), m.tank.ram_total)
+        };
+        ui.office.refresh_procs(&groups, rt);
+    }
+}
+
+/// Cerrar un grupo entero desde la tabla (con el mismo diálogo que el acuario).
+fn confirm_kill_group(ui: &Rc<Ui>, key: &str) {
+    let Some(g) = ui.m.borrow().groups.iter().find(|g| g.key == key).cloned() else { return };
+    if g.protected {
+        ui.toasts.add_toast(adw::Toast::new(&trf("protected_msg", &[g.key.clone()])));
+        return;
+    }
+    let pids: Vec<i32> = g.procs.iter().map(|p| p.pid).collect();
+    let cpu: f64 = g.procs.iter().map(|p| p.cpu).sum();
+    let mem: f64 = g.procs.iter().map(|p| p.mem).sum();
+    let body = trf("kill_body", &[g.key.clone(), if pids.len() > 1 { format!("{}…", pids[0]) } else { pids[0].to_string() }, format!("{cpu:.0}"), fmt_bytes(mem)]);
+    let d = adw::AlertDialog::new(Some(tr("kill_head")), Some(&body));
+    d.add_response("cancel", tr("cancel"));
+    d.add_response("all", &if pids.len() > 1 { trf("kill_all", &[pids.len().to_string()]) } else { tr("kill_proc").to_string() });
+    d.set_response_appearance("all", adw::ResponseAppearance::Destructive);
+    d.set_default_response(Some("cancel"));
+    d.set_close_response("cancel");
+    let (ui2, key) = (ui.clone(), g.key.clone());
+    d.choose(Some(&ui.win), gio::Cancellable::NONE, move |resp| {
+        if resp == "all" {
+            kill_pids(&ui2, pids, key);
+        }
+    });
 }
 
 fn style_name(s: Style) -> &'static str {
@@ -228,6 +290,7 @@ fn apply_theme(ui: &Rc<Ui>, force: bool) {
     } else {
         adw::ColorScheme::ForceLight
     });
+    ui.office.set_palette(&new);
     ui.m.borrow_mut().pal = new;
     ui.area.queue_draw();
 }
@@ -345,6 +408,8 @@ fn build_ui(app: &adw::Application) {
         first_sync: true,
         gpu: gpu::GpuCache::default(),
         style: start_style(),
+        groups: vec![],
+        office: has_flag("--office") || theme::load_office(),
     }));
 
     let win = adw::ApplicationWindow::builder()
@@ -358,8 +423,13 @@ fn build_ui(app: &adw::Application) {
     let area = gpu::TankWidget::new();
     area.set_hexpand(true);
     area.set_vexpand(true);
+    let pages = gtk::Stack::new();
+    pages.add_named(&area, Some("tank"));
+    let office = office::Office::new(m.borrow().pal.clone());
+    pages.add_named(&office.root, Some("office"));
+    pages.set_visible_child_name(if m.borrow().office { "office" } else { "tank" });
     let toasts = adw::ToastOverlay::new();
-    toasts.set_child(Some(&area));
+    toasts.set_child(Some(&pages));
 
     let mk = || {
         let l = gtk::Label::new(None);
@@ -383,14 +453,24 @@ fn build_ui(app: &adw::Application) {
     let about_btn = gtk::Button::from_icon_name("help-about-symbolic");
     about_btn.add_css_class("flat");
     about_btn.set_tooltip_text(Some(tr("about")));
+    let mode_btn = gtk::Button::with_label(mode_name(m.borrow().office));
+    mode_btn.add_css_class("flat");
+    mode_btn.add_css_class("stylebtn");
+    mode_btn.set_tooltip_text(Some(tr("mode_tip")));
+    style_btn.set_visible(!m.borrow().office);
     header.pack_end(&about_btn);
     header.pack_end(&style_btn);
+    header.pack_end(&mode_btn);
     let tv = adw::ToolbarView::new();
     tv.add_top_bar(&header);
     tv.set_content(Some(&toasts));
     win.set_content(Some(&tv));
 
-    let ui = Rc::new(Ui { m: m.clone(), win: win.clone(), area: area.clone(), toasts, provider, chips, style_btn: style_btn.clone() });
+    let ui = Rc::new(Ui { m: m.clone(), win: win.clone(), area: area.clone(), toasts, provider, chips, style_btn: style_btn.clone(), mode_btn: mode_btn.clone(), pages, office: office.clone() });
+    let u = ui.clone();
+    mode_btn.connect_clicked(move |_| toggle_mode(&u));
+    let u = ui.clone();
+    *office.on_close.borrow_mut() = Some(Rc::new(move |k: &str| confirm_kill_group(&u, k)));
     let u = ui.clone();
     style_btn.connect_clicked(move |_| toggle_style(&u));
     let u = ui.clone();
@@ -457,6 +537,7 @@ fn build_ui(app: &adw::Application) {
                 m.names = (m.names + 1) % 3;
             }
             gdk::Key::t | gdk::Key::T => toggle_style(&u),
+            gdk::Key::o | gdk::Key::O => toggle_mode(&u),
             gdk::Key::space => {
                 let mut m = u.m.borrow_mut();
                 m.paused = !m.paused;

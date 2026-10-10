@@ -19,6 +19,23 @@ Built with **Rust** (GTK4 + Libadwaita), themed from the active **Omarchy** them
 
 Fish are procedural (spine‑driven body, tail and fins), not flat sprites.
 
+## Office mode: a plain task manager
+
+Press **`O`** (or the ARCADE/OFFICE button in the header) to swap the tank for a sober task manager in
+the same Omarchy theme. The choice is remembered.
+
+- **Processes**: one row per program (same grouping as the shoals): processes, PID, CPU, RAM with a
+  bar, disk writes. Click a column header to sort, type to filter, CLOSE sends the same
+  SIGTERM→SIGKILL as clicking a fish. Session processes (Hyprland, pipewire…) can't be closed here
+  either.
+- **Performance**: CPU, RAM, disk writes and CPU temperature with a two‑minute history each, plus load
+  average, read throughput and GPU/NVMe temperatures.
+
+![Office mode](docs/office.png)
+
+`thermalacuarium --office` starts there. More tabs with their own "arcade" skins (memory as a
+volcano, disks as rivers, sensors as weather) are planned.
+
 ## Four visual styles
 
 Press **`T`** (or click the style button in the header) to cycle; the choice is remembered
@@ -53,7 +70,7 @@ their natural colors (a clownfish is still orange). Preview other themes without
 - **Hover** a fish: name, PID, RAM, CPU, disk writes. Its shoal lights up.
 - **Click** a fish: confirm dialog → close that process (or the whole shoal). It sends `SIGTERM` and,
   if the process is still the same one after 3 s, `SIGKILL`. The fish floats belly‑up while it dies.
-- `L` cycles name labels (big shoals / all / none) · `Space` pauses · `T` switches style · the ⓘ button in the header opens *About* (with the link to the author's X, [@theinaog](https://x.com/theinaog)).
+- `L` cycles name labels (big shoals / all / none) · `Space` pauses · `T` switches style · `O` toggles office mode · the ⓘ button in the header opens *About* (with the link to the author's X, [@theinaog](https://x.com/theinaog)).
 - Processes that start swim in from the sides; processes that exit dissolve into bubbles.
 
 Only processes of your own user are shown. The tank holds the 180 biggest.
@@ -110,6 +127,7 @@ THERMALACUARIUM_LANG=es thermalacuarium
 thermalacuarium --snapshot out.png [--style real] [--size 1180x680] [--seconds 8] [--temp 99] [--demo] [--dying 3] [--names 1] [--hover 600,300] [--bench]
 thermalacuarium --snapshot gallery.png --gallery --style real --len 210   # all reef species
 thermalacuarium --snapshot gallery.png --gallery --style pixel --len 300  # all pixel species
+thermalacuarium --office           # start in the task-manager view
 thermalacuarium --theme nord       # preview another Omarchy theme (or THERMALACUARIUM_THEME=nord)
 thermalacuarium --new-instance     # open another window without activating the running one
 ```
