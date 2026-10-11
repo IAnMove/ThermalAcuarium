@@ -71,9 +71,6 @@ struct Model {
     tank: Tank,
     pal: Palette,
     font: String,
-    sensors: Sensors,
-    sys: SysSampler,
-    disks: DiskSampler,
     hover: Option<Pick>,
     cursor: Option<(f64, f64)>,
     names: u8,
@@ -126,12 +123,22 @@ fn chip(pal: &Palette, key: &str, val: &str, vcol: Option<Rgb>) -> String {
 
 // ---------------------------------------------------------------- muestreo
 
-fn update_sensors(ui: &Rc<Ui>) {
+/// Muestra de sensores, sistema y discos, tomada en el hilo de muestreo.
+type SensorSample = (sys::Reading, sys::SysReading, Vec<sys::Disk>);
+
+/// Aplica a la interfaz una muestra ya leída (leerla cuesta cientos de ms en algunos equipos:
+/// nunca en este hilo).
+fn update_sensors(ui: &Rc<Ui>, sample: SensorSample) {
+    let t0 = std::time::Instant::now();
+    update_sensors_inner(ui, sample);
+    if std::env::var_os("TA_PROF").is_some() {
+        eprintln!("update_sensors (aplicar): {:.1} ms", t0.elapsed().as_secs_f64() * 1000.0);
+    }
+}
+
+fn update_sensors_inner(ui: &Rc<Ui>, (r, s, disks): SensorSample) {
     let mut guard = ui.m.borrow_mut();
     let m = &mut *guard;
-    let r = m.sensors.read();
-    let s = m.sys.sample();
-    let disks = m.disks.sample();
     ui.rivers.borrow_mut().set_disks(&disks);
     ui.office.refresh_disks(&disks);
     let temp = demo_temp().or(r.cpu);
@@ -163,6 +170,14 @@ fn update_sensors(ui: &Rc<Ui>) {
 
 /// Aplica una muestra de procesos (viene del hilo de muestreo).
 fn apply_procs(ui: &Rc<Ui>, groups: Vec<Group>) {
+    let t0 = std::time::Instant::now();
+    apply_procs_inner(ui, groups);
+    if std::env::var_os("TA_PROF").is_some() {
+        eprintln!("apply_procs: {:.1} ms", t0.elapsed().as_secs_f64() * 1000.0);
+    }
+}
+
+fn apply_procs_inner(ui: &Rc<Ui>, groups: Vec<Group>) {
     let mut m = ui.m.borrow_mut();
     let first = m.first_sync;
     m.first_sync = false;
@@ -418,9 +433,6 @@ fn build_ui(app: &adw::Application) {
         tank: Tank::new(1180.0, 680.0, seed()),
         pal: Palette::load(),
         font: current_font(),
-        sensors: Sensors::new(),
-        sys: SysSampler::default(),
-        disks: DiskSampler::default(),
         hover: None,
         cursor: None,
         names: 0,
@@ -499,6 +511,12 @@ fn build_ui(app: &adw::Application) {
         l
     };
     let chips = Chips { temp: mk(), cpu: mk(), ram: mk(), disk: mk(), fish: mk() };
+    // Anchura fija: si el chip crece o encoge con cada valor, la cabecera cambia de tamaño cada
+    // segundo y, con ella, la pecera (unos píxeles), lo que obliga a rehacer sus capas.
+    for (l, n) in [(&chips.temp, 7), (&chips.cpu, 9), (&chips.ram, 20), (&chips.disk, 16), (&chips.fish, 11)] {
+        l.set_width_chars(n);
+        l.set_xalign(0.0);
+    }
     let chip_box = gtk::Box::new(gtk::Orientation::Horizontal, 0);
     for l in [&chips.temp, &chips.cpu, &chips.ram, &chips.disk, &chips.fish] {
         chip_box.append(l);
@@ -562,15 +580,22 @@ fn build_ui(app: &adw::Application) {
         }
     });
 
-    // Reloj de animación: sincronizado con el frame clock y limitado a ~30 FPS para no gastar CPU.
+    // Reloj de animación: sincronizado con el frame clock de la ventana.
     let u = ui.clone();
     let ticks: Rc<std::cell::Cell<u32>> = Rc::new(std::cell::Cell::new(0));
     area.add_tick_callback(move |a, clock| {
         let now = clock.frame_time();
         if prof {
             ticks.set(ticks.get() + 1);
-            if ticks.get() % 120 == 0 {
-                eprintln!("tank tick: mapped={}", a.is_mapped());
+            if ticks.get() % 300 == 0 {
+                eprintln!("ticks: {} · t={:.1} s", ticks.get(), now as f64 / 1e6);
+            }
+            let last = u.m.borrow().last_frame;
+            if let Some(l) = last {
+                let gap = (now - l) as f64 / 1e3;
+                if gap > 45.0 {
+                    eprintln!("GAP {:.0} ms entre fotogramas (tick {})", gap, ticks.get());
+                }
             }
         }
         {
@@ -579,8 +604,10 @@ fn build_ui(app: &adw::Application) {
                 m.last_frame = None;
                 return glib::ControlFlow::Continue;
             }
+            // Un fotograma por refresco de pantalla hasta 60 Hz (en pantallas más rápidas, cada
+            // 2–3 refrescos, siempre los mismos): la animación va suave; los datos llegan aparte.
             let dt = m.last_frame.map_or(0.0, |l| (now - l) as f64 / 1e6);
-            if m.last_frame.is_some() && dt < 1.0 / 31.0 {
+            if m.last_frame.is_some() && dt < 0.015 {
                 return glib::ControlFlow::Continue;
             }
             m.last_frame = Some(now);
@@ -647,7 +674,34 @@ fn build_ui(app: &adw::Application) {
     win.add_controller(keys);
 
     apply_theme(&ui, true);
-    update_sensors(&ui);
+    // Sensores, /proc/stat, meminfo, diskstats y statvfs de cada montaje: en su propio hilo, una
+    // muestra por segundo. Leer hwmon o un montaje lento puede tardar cientos de ms.
+    let (stx, srx) = std::sync::mpsc::channel::<SensorSample>();
+    std::thread::Builder::new()
+        .name("sensors".into())
+        .spawn(move || {
+            let sensors = Sensors::new();
+            let mut sys = SysSampler::default();
+            let mut disks = DiskSampler::default();
+            let prof = std::env::var_os("TA_PROF").is_some();
+            loop {
+                let t0 = std::time::Instant::now();
+                let r = sensors.read();
+                let t1 = t0.elapsed();
+                let s = sys.sample();
+                let t2 = t0.elapsed();
+                let d = disks.sample();
+                let t3 = t0.elapsed();
+                if prof {
+                    eprintln!("muestreo: hwmon {:.0} ms · sistema {:.0} ms · discos {:.0} ms", t1.as_secs_f64() * 1e3, (t2 - t1).as_secs_f64() * 1e3, (t3 - t2).as_secs_f64() * 1e3);
+                }
+                if stx.send((r, s, d)).is_err() {
+                    return;
+                }
+                std::thread::sleep(Duration::from_secs(1).saturating_sub(t0.elapsed()));
+            }
+        })
+        .expect("hilo de sensores");
     // El muestreo de /proc va en su propio hilo (lee cientos de archivos): la interfaz no se
     // bloquea nunca. La primera muestra solo sirve de referencia para medir la CPU.
     let (tx, rx) = std::sync::mpsc::channel::<Vec<Group>>();
@@ -674,11 +728,13 @@ fn build_ui(app: &adw::Application) {
         if let Some(g) = last {
             apply_procs(&u, g);
         }
-        glib::ControlFlow::Continue
-    });
-    let u = ui.clone();
-    glib::timeout_add_seconds_local(1, move || {
-        update_sensors(&u);
+        let mut last = None;
+        while let Ok(sm) = srx.try_recv() {
+            last = Some(sm);
+        }
+        if let Some(sm) = last {
+            update_sensors(&u, sm);
+        }
         glib::ControlFlow::Continue
     });
     // Respaldo por si el sistema de archivos no avisa (p. ej. temas editados desde fuera).

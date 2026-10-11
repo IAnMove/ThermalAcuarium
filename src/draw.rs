@@ -465,6 +465,67 @@ pub fn decor(cr: &Context, v: &View, d: &Decor, hover: bool) {
     decor_at(cr, v.pal, d, &decor_pose(v.tank, d, hover));
 }
 
+/// Clave de un sprite de decoración estilizada: pieza, tamaño (cubo), fase del balanceo y agitación.
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
+pub struct DKey {
+    pub kind: u8,
+    pub seed: u64,
+    pub size: i16,
+    pub phase: u8,
+    pub agit: u8,
+}
+
+pub struct DecorSurf {
+    pub surf: cairo::ImageSurface,
+    /// Caja lógica y origen (base de la pieza) dentro de ella.
+    pub w: f64,
+    pub h: f64,
+    pub ox: f64,
+    pub oy: f64,
+    pub size: f64,
+}
+
+/// Pinta a un sprite la pieza `d` en la fase `k.phase` y tamaño `bs` (cubo). En Pixel se pinta a una
+/// celda por píxel (se amplía luego sin suavizado); en Sonar, como silueta apagada. Puro Cairo:
+/// se puede llamar desde el hilo de sprites.
+pub fn render_decor(d: &Decor, k: &DKey, bs: f64, style: Style, cell: f64, pal: &Palette, ds: f64) -> Option<DecorSurf> {
+    let np = decor_phases(d.kind) as f64;
+    let s = bs;
+    let (hw, top, bot) = (s * 0.72 + 8.0, s * 1.2 + 10.0, 12.0);
+    let (bw, bh) = (hw * 2.0, top + bot);
+    let agit = 1.0 + 2.5 * (k.agit as f64 / 3.0);
+    let pose = DecorPose { x: 0.0, y: 0.0, size: s, phase: (k.phase as f64 + 0.5) / np * 2.0 * PI, agit, hover: false };
+    let px = style == Style::Pixel;
+    let surf = if px {
+        cairo::ImageSurface::create(cairo::Format::ARgb32, (bw / cell).ceil().max(1.0) as i32, (bh / cell).ceil().max(1.0) as i32).ok()?
+    } else {
+        let sf = cairo::ImageSurface::create(cairo::Format::ARgb32, (bw * ds).ceil().max(1.0) as i32, (bh * ds).ceil().max(1.0) as i32).ok()?;
+        sf.set_device_scale(ds, ds);
+        sf
+    };
+    {
+        let cr = Context::new(&surf).ok()?;
+        if px {
+            cr.set_antialias(cairo::Antialias::None);
+            cr.scale(1.0 / cell, 1.0 / cell);
+        }
+        cr.translate(hw, top);
+        if style == Style::Sonar {
+            // Silueta apagada: la pieza se usa como máscara de un solo color.
+            cr.push_group();
+            decor_at(&cr, pal, d, &pose);
+            let _ = cr.pop_group_to_source();
+            let pat = cr.source();
+            let c = mix(pal.dfg, crate::sonar::line_color(pal, 0.0), 0.3);
+            cr.set_source_rgba(c.0, c.1, c.2, 0.55);
+            let _ = cr.mask(&pat);
+        } else {
+            decor_at(&cr, pal, d, &pose);
+        }
+    }
+    Some(DecorSurf { surf, w: bw, h: bh, ox: hw, oy: top, size: s })
+}
+
 /// Pinta la pieza `d` en la pose dada (coordenadas absolutas de la pecera).
 pub fn decor_at(cr: &Context, p: &Palette, d: &Decor, pose: &DecorPose) {
     let (x, y, s) = (pose.x, pose.y, pose.size);

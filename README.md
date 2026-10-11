@@ -182,7 +182,10 @@ thermalacuarium --new-instance     # open another window without activating the 
 
 ## How it stays light
 
-Animation is capped at ~30 FPS and stops when the window is hidden or the tab is not the visible one.
+Animation runs at the display's refresh (up to 60 FPS) and stops when the window is hidden or the tab
+is not the visible one. Nothing that reads the system runs on the UI thread: `/proc` and the hwmon
+sensors are sampled on their own threads (on some machines one hwmon read takes half a second) and the
+UI only applies the latest sample. Header chips have a fixed width so the layout never jitters.
 Each fish variant is painted once with Cairo into a sprite **on a worker thread**; until it arrives the
 nearest existing sprite of that shoal is shown, so the UI thread never waits for a rasterization. GTK
 composes the sprites on the GPU (transforms, gradients and bubbles are GSK nodes): building a frame of

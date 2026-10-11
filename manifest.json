@@ -2,7 +2,7 @@
   "schemaVersion": 1,
   "id": "io.github.ianmove.thermalacuarium",
   "name": "ThermalAcuarium",
-  "version": "0.10.0",
+  "version": "0.10.1",
   "author": "IAnMove",
   "license": "MIT",
   "description": "An aquarium that is your computer: every process is a fish. Bar widget with the CPU temperature that opens the monitor.",

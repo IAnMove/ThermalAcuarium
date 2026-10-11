@@ -15,11 +15,11 @@ use gtk::prelude::*;
 use gtk::subclass::prelude::*;
 use gtk::{gdk, glib, graphene, gsk, pango};
 
-use crate::draw::{self, SKey, View};
+use crate::draw::{self, DKey, SKey, View};
 use crate::reef::gpu_scene::RealGpu;
 use crate::sim::{BubbleKind, Life, Pick};
 use crate::theme::{Rgb, Style, lighten, mix};
-use crate::worker::{Job, Worker};
+use crate::worker::{Done, Job, Pixels, Worker};
 
 // ---------------------------------------------------------------- widget
 
@@ -105,16 +105,6 @@ struct DecorTex {
     size: f64,
 }
 
-/// Clave de un sprite de decoración estilizada: pieza, tamaño (cubo), fase del balanceo y agitación.
-#[derive(Clone, Copy, PartialEq, Eq, Hash)]
-struct DKey {
-    kind: u8,
-    seed: u64,
-    size: i16,
-    phase: u8,
-    agit: u8,
-}
-
 /// Familia de un sprite de pez: todo menos tamaño, fase y amplitud (los sustitutos válidos).
 type Family = (u8, u8, u8, u8, i8, bool, u8);
 
@@ -134,6 +124,9 @@ pub struct GpuCache {
     /// Pedidos al hilo de sprites y en qué fotograma se pidieron.
     pending: HashMap<SKey, u32>,
     worker: Option<Worker>,
+    /// Sprites terminados aún no subidos (se suben pocos por fotograma: cada textura nueva cuesta
+    /// una subida a la GPU en el fotograma en que aparece).
+    inbox: Vec<Done>,
     /// Sube cada vez que se vacía la caché: los sprites de otra generación se descartan.
     era: u32,
     frame: u32,
@@ -145,6 +138,8 @@ pub struct GpuCache {
     /// Agua del estilo Pixel (franjas y tramado), por tono.
     pixel_water: Option<(i32, gdk::MemoryTexture)>,
     decor: HashMap<DKey, DecorTex>,
+    decor_bytes: usize,
+    dpending: HashMap<DKey, u32>,
     decor_budget: u32,
     layouts: HashMap<(String, u32), pango::Layout>,
     budget: u32,
@@ -167,6 +162,9 @@ impl GpuCache {
         self.index.clear();
         self.pending.clear();
         self.decor.clear();
+        self.decor_bytes = 0;
+        self.dpending.clear();
+        self.inbox.clear();
         self.bytes = 0;
         self.era = self.era.wrapping_add(1);
     }
@@ -184,45 +182,82 @@ impl GpuCache {
         self.index.entry(family(&key)).or_default().push(key);
     }
 
-    /// Si la caché pesa demasiado, suelta los sprites que llevan más de 20 s sin usarse (y, si no
-    /// basta, lo vacía todo).
+    /// Si la caché pesa demasiado, suelta los sprites menos usados recientemente hasta volver a
+    /// tres cuartos del límite (nunca se vacía de golpe: eso hacía desaparecer a todos los peces).
     fn evict(&mut self) {
+        // La decoración se cuenta aparte (sus bytes no están en `sprites`): si se pasa, se
+        // suelta entera y se rehace a dos piezas por fotograma.
+        if self.decor_bytes > MAX_DECOR_BYTES {
+            self.decor.clear();
+            self.decor_bytes = 0;
+            self.dpending.clear();
+        }
         if self.bytes <= MAX_SPRITE_BYTES {
             return;
         }
+        if std::env::var_os("TA_PROF").is_some() {
+            eprintln!("expulsión: {} sprites · {} MB", self.sprites.len(), self.bytes >> 20);
+        }
         let frame = self.frame;
-        self.sprites.retain(|_, s| frame.wrapping_sub(s.used) < 600);
-        self.bytes = self.sprites.values().map(|s| s.bytes).sum();
+        let mut by_age: Vec<(u32, SKey, usize)> = self.sprites.iter().map(|(k, s)| (frame.wrapping_sub(s.used), *k, s.bytes)).collect();
+        by_age.sort_unstable_by(|a, b| b.0.cmp(&a.0));
+        let target = MAX_SPRITE_BYTES * 3 / 4;
+        for (_, k, b) in by_age {
+            if self.bytes <= target {
+                break;
+            }
+            self.sprites.remove(&k);
+            self.bytes = self.bytes.saturating_sub(b);
+        }
         self.index.clear();
         for k in self.sprites.keys() {
             self.index.entry(family(k)).or_default().push(*k);
-        }
-        if self.bytes > MAX_SPRITE_BYTES {
-            self.clear_sprites();
         }
     }
 
     /// Recoge los sprites que el hilo haya terminado.
     fn collect(&mut self, ds: f64) {
         let Some(w) = &self.worker else { return };
-        let done = w.poll();
-        if !done.is_empty() && std::env::var_os("TA_PROF").is_some() {
-            let ok = done.iter().filter(|d| d.era == self.era).count();
-            eprintln!("sprites: {} recibidos ({} de esta era) · {} pendientes · era {}", done.len(), ok, self.pending.len(), self.era);
+        self.inbox.extend(w.poll());
+        if self.inbox.is_empty() {
+            return;
         }
+        let n = self.inbox.len().min(MAX_UPLOADS_PER_FRAME);
+        let done: Vec<Done> = self.inbox.drain(..n).collect();
+        if std::env::var_os("TA_PROF").is_some() && self.inbox.len() > 40 {
+            eprintln!("sprites: {} en espera de subir · {} + {} pendientes", self.inbox.len(), self.pending.len(), self.dpending.len());
+        }
+        let tex_of = |px: Pixels| {
+            let bytes = glib::Bytes::from_owned(px.data);
+            gdk::MemoryTexture::new(px.w, px.h, gdk::MemoryFormat::B8g8r8a8Premultiplied, &bytes, px.stride as usize)
+        };
         for d in done {
-            self.pending.remove(&d.key);
-            if d.era != self.era || self.sprites.contains_key(&d.key) {
-                continue;
+            match d {
+                Done::Fish { key, era, px, ox, oy, len } => {
+                    self.pending.remove(&key);
+                    if era != self.era || self.sprites.contains_key(&key) {
+                        continue;
+                    }
+                    let (wp, hp) = (px.w, px.h);
+                    self.insert_sprite(key, tex_of(px), wp, hp, ox, oy, len, ds);
+                }
+                Done::Decor { key, era, px, w, h, ox, oy, size } => {
+                    self.dpending.remove(&key);
+                    if era != self.era || self.decor.contains_key(&key) {
+                        continue;
+                    }
+                    self.decor_bytes += (px.w * px.h * 4) as usize;
+                    self.decor.insert(key, DecorTex { tex: tex_of(px), w: w as f32, h: h as f32, ox: ox as f32, oy: oy as f32, size });
+                }
             }
-            let bytes = glib::Bytes::from_owned(d.data);
-            let tex = gdk::MemoryTexture::new(d.w, d.h, gdk::MemoryFormat::B8g8r8a8Premultiplied, &bytes, d.stride as usize);
-            self.insert_sprite(d.key, tex, d.w, d.h, d.ox, d.oy, d.len, ds);
         }
     }
 }
 
 const MAX_SPRITE_BYTES: usize = 160 << 20;
+/// Texturas nuevas por fotograma (sprites recién pintados).
+const MAX_UPLOADS_PER_FRAME: usize = 12;
+const MAX_DECOR_BYTES: usize = 48 << 20;
 
 pub(crate) fn texture_of(mut surf: cairo::ImageSurface) -> Option<gdk::MemoryTexture> {
     let (w, h, stride) = (surf.width(), surf.height(), surf.stride() as usize);
@@ -322,17 +357,26 @@ pub fn render(widget: &gtk::Widget, snap: &gtk::Snapshot, v: &View, cache: &mut 
     let ds = widget.scale_factor().max(1) as f64;
     let size = (w as i32, h as i32);
     cache.frame = cache.frame.wrapping_add(1);
+    let prof = std::env::var_os("TA_PROF").is_some();
     if cache.style != Some(v.style) {
+        if prof {
+            eprintln!("caché vaciada: cambio de estilo");
+        }
         cache.clear_sprites();
         cache.real.clear();
         cache.style = Some(v.style);
     }
-    if cache.pal != v.pal.raw || (cache.ds - ds).abs() > 0.01 || cache.size != size {
-        if cache.pal != v.pal.raw {
-            // Otro tema de Omarchy: el agua, la arena y los peces del estilo realista se recalculan.
-            cache.real.clear();
+    if cache.pal != v.pal.raw || (cache.ds - ds).abs() > 0.01 {
+        if prof {
+            eprintln!("caché vaciada: paleta {} · ds {}→{}", cache.pal != v.pal.raw, cache.ds, ds);
         }
+        // Otro tema de Omarchy u otra escala: todo se recalcula.
+        cache.real.clear();
         cache.clear_sprites();
+    }
+    if cache.pal != v.pal.raw || (cache.ds - ds).abs() > 0.01 || cache.size != size {
+        // Los sprites de los peces no dependen del tamaño de la pecera: solo se rehacen las capas
+        // del fondo (la cabecera puede cambiar unos píxeles el tamaño cada segundo).
         cache.rays = None;
         cache.scan = None;
         cache.caustic = None;
@@ -351,8 +395,8 @@ pub fn render(widget: &gtk::Widget, snap: &gtk::Snapshot, v: &View, cache: &mut 
     cache.collect(ds);
     // Renderizado síncrono solo de emergencia (un pez sin ningún sprite parecido): el resto lo
     // hace el hilo de sprites.
-    cache.budget = if v.style == Style::Realistic { 1 } else { 2 };
-    cache.decor_budget = 2;
+    cache.budget = 1;
+    cache.decor_budget = 1;
     if v.style == Style::Realistic {
         if (cache.ds - ds).abs() > 0.01 {
             cache.real.clear();
@@ -674,55 +718,39 @@ fn sonar_render(widget: &gtk::Widget, snap: &gtk::Snapshot, v: &View, cache: &mu
 
 // ---------------------------------------------------------------- decoración
 
-/// Asegura el sprite de decoración `k`; si no hay presupuesto, devuelve la fase más cercana que exista.
+/// Sprite de decoración `k`: si no existe se pide al hilo de sprites y se devuelve la fase más
+/// cercana que ya exista. Solo si no hay ninguna de la pieza se pinta en el acto (una por fotograma).
 fn ensure_decor(cache: &mut GpuCache, v: &View, d: &crate::sim::Decor, k: DKey, bs: f64, ds: f64) -> Option<DKey> {
     if cache.decor.contains_key(&k) {
         return Some(k);
     }
+    let frame = cache.frame;
+    let stale = cache.dpending.get(&k).is_some_and(|&fr| frame.wrapping_sub(fr) > 90);
+    if (stale || !cache.dpending.contains_key(&k)) && cache.dpending.len() < 64 {
+        let job = Job::Decor { key: k, d: Box::new(d.clone()), size: bs, style: v.style, cell: draw::cell(), era: cache.era };
+        cache.worker(v.pal, ds).request(job);
+        cache.dpending.insert(k, frame);
+    }
     let np = draw::decor_phases(d.kind) as i32;
-    if cache.decor_budget == 0 {
-        return cache
-            .decor
-            .keys()
-            .filter(|o| o.kind == k.kind && o.seed == k.seed && o.size == k.size && o.agit == k.agit)
-            .min_by_key(|o| {
-                let dp = (o.phase as i32 - k.phase as i32).abs();
-                dp.min(np - dp)
-            })
-            .copied();
+    let near = cache
+        .decor
+        .keys()
+        .filter(|o| o.kind == k.kind && o.seed == k.seed && o.size == k.size)
+        .min_by_key(|o| {
+            let dp = (o.phase as i32 - k.phase as i32).abs();
+            dp.min(np - dp) + (o.agit as i32 - k.agit as i32).abs() * 4
+        })
+        .copied();
+    if near.is_some() || cache.decor_budget == 0 {
+        return near;
     }
     cache.decor_budget -= 1;
-    let px = v.style == Style::Pixel;
-    let s = bs;
-    let (hw, top, bot) = (s * 0.72 + 8.0, s * 1.2 + 10.0, 12.0);
-    let (bw, bh) = (hw * 2.0, top + bot);
-    let agit = 1.0 + 2.5 * (k.agit as f64 / 3.0);
-    let pose = draw::DecorPose { x: 0.0, y: 0.0, size: s, phase: (k.phase as f64 + 0.5) / np as f64 * 2.0 * std::f64::consts::PI, agit, hover: false };
-    let paint = |cr: &cairo::Context| {
-        cr.translate(hw, top);
-        if v.style == Style::Sonar {
-            // Silueta apagada: la pieza se usa como máscara de un solo color.
-            cr.push_group();
-            draw::decor_at(cr, v.pal, d, &pose);
-            let _ = cr.pop_group_to_source();
-            let pat = cr.source();
-            let c = mix(v.pal.dfg, crate::sonar::line_color(v.pal, 0.0), 0.3);
-            cr.set_source_rgba(c.0, c.1, c.2, 0.55);
-            let _ = cr.mask(&pat);
-        } else {
-            draw::decor_at(cr, v.pal, d, &pose);
-        }
-    };
-    let (tex, wp, hp) = if px {
-        let cell = draw::cell();
-        let tex = bake_px(bw, bh, cell, paint)?;
-        (tex, (bw / cell).ceil() as i32, (bh / cell).ceil() as i32)
-    } else {
-        let tex = bake(bw, bh, ds, paint)?;
-        ((tex), (bw * ds).ceil() as i32, (bh * ds).ceil() as i32)
-    };
-    cache.bytes += (wp * hp * 4) as usize;
-    cache.decor.insert(k, DecorTex { tex, w: bw as f32, h: bh as f32, ox: hw as f32, oy: top as f32, size: s });
+    let r = draw::render_decor(d, &k, bs, v.style, draw::cell(), v.pal, ds)?;
+    let (wp, hp) = (r.surf.width(), r.surf.height());
+    let tex = texture_of(r.surf)?;
+    cache.decor_bytes += (wp * hp * 4) as usize;
+    cache.decor.insert(k, DecorTex { tex, w: r.w as f32, h: r.h as f32, ox: r.ox as f32, oy: r.oy as f32, size: r.size });
+    cache.dpending.remove(&k);
     Some(k)
 }
 
@@ -800,7 +828,7 @@ fn sprite<'a>(cache: &'a mut GpuCache, v: &View, i: usize, ds: f64) -> Option<&'
     } else {
         let stale = cache.pending.get(&key).is_some_and(|&fr| frame.wrapping_sub(fr) > 90);
         if (stale || !cache.pending.contains_key(&key)) && cache.pending.len() < 256 {
-            let job = Job { key, look: f.look, len: f.len, blen, era: cache.era };
+            let job = Job::Fish { key, look: f.look, len: f.len, blen, era: cache.era };
             cache.worker(v.pal, ds).request(job);
             cache.pending.insert(key, frame);
         }

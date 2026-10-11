@@ -199,6 +199,7 @@ pub struct Bubble {
 }
 
 /// Proceso protegido: decoración fija en el fondo.
+#[derive(Clone)]
 pub struct Decor {
     pub pid: i32,
     pub start: u64,

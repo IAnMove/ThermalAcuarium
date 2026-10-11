@@ -30,6 +30,9 @@ pub struct Reading {
 
 pub struct Sensors {
     by_name: HashMap<String, Vec<String>>,
+    /// Archivos `fanN_input` que existen (y su `fanN_max`), descubiertos una vez: leer los que no
+    /// existen en cada hwmon costaba cientos de ms por muestra en algunos equipos.
+    fans: Vec<(String, Option<String>)>,
 }
 
 impl Sensors {
@@ -43,7 +46,19 @@ impl Sensors {
                 }
             }
         }
-        Sensors { by_name }
+        let mut fans = vec![];
+        for paths in by_name.values() {
+            for p in paths {
+                for i in 1..=8 {
+                    let f = format!("{p}/fan{i}_input");
+                    if std::path::Path::new(&f).exists() {
+                        let m = format!("{p}/fan{i}_max");
+                        fans.push((f, std::path::Path::new(&m).exists().then_some(m)));
+                    }
+                }
+            }
+        }
+        Sensors { by_name, fans }
     }
 
     fn temp(&self, name: &str) -> Option<f64> {
@@ -61,15 +76,11 @@ impl Sensors {
             .and_then(|s| s.split_whitespace().next().and_then(|x| x.parse().ok()))
             .unwrap_or(0.0);
         let (mut fan, mut fan_max) = (None, None);
-        for paths in self.by_name.values() {
-            for p in paths {
-                for i in 1..=8 {
-                    if let Some(v) = rd_int(&format!("{p}/fan{i}_input")) {
-                        fan = Some(fan.map_or(v, |f: i64| f.max(v)));
-                        if let Some(m) = rd_int(&format!("{p}/fan{i}_max")) {
-                            fan_max = Some(fan_max.map_or(m, |f: i64| f.max(m)));
-                        }
-                    }
+        for (f, m) in &self.fans {
+            if let Some(v) = rd_int(f) {
+                fan = Some(fan.map_or(v, |x: i64| x.max(v)));
+                if let Some(mv) = m.as_ref().and_then(|m| rd_int(m)) {
+                    fan_max = Some(fan_max.map_or(mv, |x: i64| x.max(mv)));
                 }
             }
         }

@@ -6,29 +6,35 @@
 
 use std::sync::mpsc::{Receiver, Sender, TryRecvError, channel};
 
-use crate::draw::{SKey, render_sprite};
-use crate::sim::Look;
-use crate::theme::Palette;
+use gtk::cairo;
 
-pub struct Job {
-    pub key: SKey,
-    pub look: Look,
-    pub len: f64,
-    pub blen: f64,
-    /// Generación de la caché que lo pidió: si cambió (tema, estilo, escala) el resultado se tira.
-    pub era: u32,
+use crate::draw::{DKey, SKey, render_decor, render_sprite};
+use crate::sim::{Decor, Look};
+use crate::theme::{Palette, Style};
+
+pub enum Job {
+    Fish { key: SKey, look: Look, len: f64, blen: f64, era: u32 },
+    Decor { key: DKey, d: Box<Decor>, size: f64, style: Style, cell: f64, era: u32 },
 }
 
-pub struct Done {
-    pub key: SKey,
-    pub era: u32,
+/// Un sprite terminado: píxeles BGRA premultiplicados y su geometría.
+pub struct Pixels {
     pub w: i32,
     pub h: i32,
     pub stride: i32,
     pub data: Vec<u8>,
-    pub ox: f64,
-    pub oy: f64,
-    pub len: f64,
+}
+
+pub enum Done {
+    Fish { key: SKey, era: u32, px: Pixels, ox: f64, oy: f64, len: f64 },
+    Decor { key: DKey, era: u32, px: Pixels, w: f64, h: f64, ox: f64, oy: f64, size: f64 },
+}
+
+fn pixels(mut surf: cairo::ImageSurface) -> Option<Pixels> {
+    surf.flush();
+    let (w, h, stride) = (surf.width(), surf.height(), surf.stride());
+    let data = surf.data().ok()?.to_vec();
+    Some(Pixels { w, h, stride, data })
 }
 
 enum Msg {
@@ -99,12 +105,18 @@ fn run(jobs: Receiver<Msg>, done: Sender<Done>, mut pal: Palette, mut ds: f64) {
             }
         }
         while let Some(j) = queue.pop() {
-            let spr = render_sprite(&j.look, j.len, &j.key, j.blen, &pal, ds);
-            let mut surf = spr.surf;
-            surf.flush();
-            let (w, h, stride) = (surf.width(), surf.height(), surf.stride());
-            let Ok(data) = surf.data() else { continue };
-            let d = Done { key: j.key, era: j.era, w, h, stride, data: data.to_vec(), ox: spr.ox, oy: spr.oy, len: spr.len };
+            let d = match j {
+                Job::Fish { key, look, len, blen, era } => {
+                    let spr = render_sprite(&look, len, &key, blen, &pal, ds);
+                    let Some(px) = pixels(spr.surf) else { continue };
+                    Done::Fish { key, era, px, ox: spr.ox, oy: spr.oy, len: spr.len }
+                }
+                Job::Decor { key, d, size, style, cell, era } => {
+                    let Some(ds_) = render_decor(&d, &key, size, style, cell, &pal, ds) else { continue };
+                    let Some(px) = pixels(ds_.surf) else { continue };
+                    Done::Decor { key, era, px, w: ds_.w, h: ds_.h, ox: ds_.ox, oy: ds_.oy, size: ds_.size }
+                }
+            };
             if done.send(d).is_err() {
                 return;
             }
