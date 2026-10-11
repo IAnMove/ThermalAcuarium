@@ -17,6 +17,7 @@ use crate::draw::{Quiet, lin, rgba};
 use crate::i18n::tr;
 use crate::reef::noise;
 use crate::sim::Rng;
+use crate::stamps::Stamps;
 use crate::sys::Reading;
 use crate::theme::{Palette, Rgb, darken, lighten, mix};
 
@@ -30,7 +31,8 @@ struct Cloud {
     x: f64,
     y: f64,
     w: f64,
-    puffs: Vec<(f64, f64, f64)>,
+    /// (dx, dy, radio, variante de sello)
+    puffs: Vec<(f64, f64, f64, usize)>,
     z: f64,
 }
 
@@ -74,6 +76,9 @@ pub struct Weather {
     land: RefCell<Option<ImageSurface>>,
     sky_key: RefCell<Option<i32>>,
     sky: RefCell<Option<ImageSurface>>,
+    blobs: Stamps,
+    /// Hierba horneada por (fase de inclinación, calor, tamaño).
+    grass: RefCell<Vec<((i32, i32, i32, i32), ImageSurface)>>,
 }
 
 impl Weather {
@@ -83,7 +88,14 @@ impl Weather {
             .map(|i| {
                 let z = 0.4 + 0.6 * rng.next();
                 let w = (70.0 + 120.0 * rng.next()) * z;
-                let puffs = (0..6).map(|k| (((k as f64 / 5.0) - 0.5) * w * 0.8, rng.gauss() * w * 0.08, w * (0.22 + 0.16 * rng.next()))).collect();
+                let puffs = (0..7)
+                    .map(|k| {
+                        let u = (k as f64 / 6.0) - 0.5;
+                        // Más altas y gordas en el centro, bajas en los extremos.
+                        let r = w * (0.20 + 0.18 * (1.0 - u.abs() * 1.6).max(0.2) + 0.06 * rng.next());
+                        (u * w * 0.9, -r * 0.35 * (1.0 - u.abs() * 1.4).max(0.0) + rng.gauss() * w * 0.03, r, (rng.next() * 3.0) as usize)
+                    })
+                    .collect();
                 Cloud { x: rng.next() * 1400.0, y: 40.0 + 120.0 * rng.next() * z + i as f64 * 6.0, w, puffs, z }
             })
             .collect();
@@ -114,6 +126,8 @@ impl Weather {
             land: RefCell::new(None),
             sky_key: RefCell::new(None),
             sky: RefCell::new(None),
+            blobs: Stamps::new(3, 3100),
+            grass: RefCell::new(vec![]),
         }
     }
 
@@ -252,8 +266,19 @@ impl Weather {
             cr.line_to(w, hz + 20.0);
             cr.close_path();
             let c = mix(mix((0.42, 0.50, 0.44), pal.dfg, 0.4), (0.22, 0.34, 0.20), k);
-            rgba(cr, c, 1.0);
-            cr.fill_q();
+            // Más claras en las crestas (luz) y más oscuras en la falda, con bruma entre capas.
+            let _ = cr.set_source(lin(0.0, hz * (base - amp), 0.0, hz, &[(0.0, lighten(c, 0.18), 1.0), (1.0, darken(c, 0.25), 1.0)]));
+            cr.fill_keep();
+            cr.save_q();
+            cr.clip();
+            let mtile = noise::grey_tile(256, 28, 3, 707 + i, 1.1);
+            let mpat = cairo::SurfacePattern::create(&mtile);
+            mpat.set_extend(cairo::Extend::Repeat);
+            cr.set_operator(cairo::Operator::SoftLight);
+            let _ = cr.set_source(&mpat);
+            let _ = cr.paint_with_alpha(0.28 - 0.06 * i as f64);
+            cr.set_operator(cairo::Operator::Over);
+            cr.restore_q();
         }
         let grass = mix((0.30, 0.50, 0.24), mix(pal.green, pal.dbg, 0.4), 0.3);
         let _ = cr.set_source(lin(0.0, hz, 0.0, h, &[(0.0, lighten(grass, 0.1), 1.0), (1.0, darken(grass, 0.4), 1.0)]));
@@ -293,6 +318,19 @@ impl Weather {
         }
     }
 
+    fn bush(cr: &Context, blobs: &Stamps, x: f64, y: f64, s: f64, bend: f64, col: Rgb) {
+        // Tronco corto y copa redonda de tres manchas, inclinada por el viento.
+        rgba(cr, darken(col, 0.6), 1.0);
+        cr.set_line_width((s * 0.14).max(1.5));
+        cr.move_to(x, y);
+        cr.line_to(x + bend * s * 0.3, y - s * 0.6);
+        cr.stroke_q();
+        for (k, (dx, dy, r)) in [(0.0, -0.95, 0.55), (-0.45, -0.7, 0.42), (0.45, -0.72, 0.4)].into_iter().enumerate() {
+            rgba(cr, if k == 0 { lighten(col, 0.12) } else { darken(col, 0.1) }, 1.0);
+            blobs.paint(cr, k, x + dx * s + bend * s * (0.35 - dy * 0.4), y + dy * s, r * s, r * s * 0.85);
+        }
+    }
+
     pub fn draw(&self, cr: &Context, pal: &Palette, font: &str) {
         let (w, h) = (self.w, self.h);
         let hz = self.horizon();
@@ -308,6 +346,7 @@ impl Weather {
         cr.select_font_face(font, cairo::FontSlant::Normal, cairo::FontWeight::Bold);
         let fs = (11.0 * sc).clamp(10.0, 14.0);
         cr.set_font_size(fs);
+        let mut laps = crate::draw::Laps::new("weather");
 
         // Cielo y sol: se hornean por grado de temperatura (cambian despacio).
         let (top, hzc) = self.sky(pal);
@@ -348,39 +387,89 @@ impl Weather {
         cr.rectangle(0.0, hz * 0.8, w, h - hz * 0.8);
         cr.fill_q();
 
-        // Árboles y hierba que se doblan con el viento.
+        laps.lap("fondo");
+        // Árboles y hierba que se doblan con el viento. De lejos a cerca, más grandes cuanto más cerca.
         let bend = self.wind * (0.6 + 0.4 * (self.t * 1.7).sin().abs()) + 0.08 * (self.t * 5.0).sin() * self.wind;
         let tree_col = mix(mix((0.16, 0.36, 0.18), pal.green, 0.25), (0.35, 0.22, 0.1), 0.6 * hot);
-        for i in 0..18u64 {
-            let x = noise::rnd(i as i32, 1, 77) * w;
-            let yy = hz + 6.0 + noise::rnd(i as i32, 2, 77) * (h - hz) * 0.9;
-            let s = (10.0 + 18.0 * noise::rnd(i as i32, 3, 77)) * (0.5 + (yy - hz) / (h - hz)) * sc;
-            Self::tree(cr, x, yy, s, bend * (0.8 + 0.4 * noise::rnd(i as i32, 4, 77)), tree_col);
+        let mut trees: Vec<(f64, f64, f64, f64, bool)> = (0..26u64)
+            .map(|i| {
+                let x = noise::rnd(i as i32, 1, 77) * w;
+                let d = noise::rnd(i as i32, 2, 77);
+                let yy = hz + 6.0 + d * (h - hz) * 0.9;
+                let s = (9.0 + 16.0 * noise::rnd(i as i32, 3, 77)) * (0.45 + 1.1 * d) * sc;
+                (x, yy, s, bend * (0.8 + 0.4 * noise::rnd(i as i32, 4, 77)), noise::rnd(i as i32, 8, 77) > 0.55)
+            })
+            .collect();
+        trees.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal));
+        for (x, yy, s, b, round) in trees {
+            // Sombra en el suelo.
+            rgba(cr, (0.0, 0.0, 0.0), 0.18);
+            self.blobs.paint(cr, 0, x + s * 0.3, yy + 1.0, s * 0.8, s * 0.22);
+            if round {
+                Self::bush(cr, &self.blobs, x, yy, s, b, tree_col);
+            } else {
+                Self::tree(cr, x, yy, s, b, tree_col);
+            }
         }
-        rgba(cr, darken(tree_col, 0.2), 0.6);
-        cr.set_line_width(1.0);
-        for i in 0..160u64 {
-            let x = noise::rnd(i as i32, 5, 78) * w;
-            let yy = hz + 4.0 + noise::rnd(i as i32, 6, 78) * (h - hz - 6.0);
-            let l = (4.0 + 6.0 * noise::rnd(i as i32, 7, 78)) * sc;
-            let b = bend * (0.9 + 0.5 * (self.t * 3.0 + x * 0.05).sin());
-            cr.move_to(x, yy);
-            cr.line_to(x + b * l, yy - l);
+        laps.lap("arboles");
+        // Matas de hierba: tres briznas por mata. Horneadas por fase de inclinación (12 fases) y
+        // tono de calor; cada fotograma solo se copia la fase más cercana.
+        {
+            let gp = ((bend.clamp(0.0, 1.2) / 1.2) * 11.0).round() as i32;
+            let hk = (hot * 6.0).round() as i32;
+            let key = (gp, hk, w as i32, h as i32);
+            let mut gc = self.grass.borrow_mut();
+            if !gc.iter().any(|(k, _)| *k == key) {
+                let gh = h - hz + 2.0;
+                let surf = ImageSurface::create(cairo::Format::ARgb32, w.ceil() as i32, gh.ceil() as i32).expect("hierba");
+                {
+                    let c = &Context::new(&surf).expect("cairo");
+                    c.translate(0.0, -(hz - 2.0));
+                    let b0 = gp as f64 / 11.0 * 1.2;
+                    rgba(c, darken(tree_col, 0.15), 0.65);
+                    c.set_line_width(1.0);
+                    for i in 0..200u64 {
+                        let x = noise::rnd(i as i32, 5, 78) * w;
+                        let d = noise::rnd(i as i32, 6, 78);
+                        let yy = hz + 4.0 + d * (h - hz - 6.0);
+                        let l = (3.0 + 7.0 * noise::rnd(i as i32, 7, 78)) * (0.5 + d) * sc;
+                        let b = b0 * (0.9 + 0.5 * (x * 0.05).sin());
+                        for k in -1..=1 {
+                            c.move_to(x + k as f64 * 1.5, yy);
+                            c.line_to(x + k as f64 * 2.5 + b * l, yy - l * (1.0 - 0.2 * (k as f64).abs()));
+                        }
+                    }
+                    c.stroke_q();
+                }
+                if gc.len() > 24 {
+                    gc.remove(0);
+                }
+                gc.push((key, surf));
+            }
+            if let Some((_, surf)) = gc.iter().find(|(k, _)| *k == key) {
+                let _ = cr.set_source_surface(surf, 0.0, hz - 2.0);
+                cr.paint_q();
+            }
         }
-        cr.stroke_q();
 
+        laps.lap("hierba");
         // Nubes: cobertura = carga; oscuras y bajas en la tormenta.
         let shown = (self.clouds.len() as f64 * self.cover).ceil() as usize;
         let cloud_c = mix(mix((0.98, 0.98, 1.0), (0.85, 0.75, 0.7), hot), (0.25, 0.12, 0.1), crit);
         for c in self.clouds.iter().take(shown.max(if self.cover > 0.05 { 1 } else { 0 })) {
             let y = c.y * (1.0 + 0.4 * crit);
-            for &(dx, dy, r) in &c.puffs {
-                let col = mix(darken(cloud_c, 0.25), cloud_c, 0.5 + 0.5 * (-dy / r.max(1.0)).clamp(-1.0, 1.0));
-                rgba(cr, col, 0.85 * (0.6 + 0.4 * c.z));
-                cr.arc(c.x + dx, y + dy, r, 0.0, 2.0 * PI);
-                cr.fill_q();
+            let a = 0.9 * (0.6 + 0.4 * c.z);
+            // Panza sombreada: la misma mancha, más oscura y un poco más abajo; luego la luz encima.
+            for &(dx, dy, r, k) in &c.puffs {
+                rgba(cr, darken(cloud_c, 0.3), a * 0.75);
+                self.blobs.paint(cr, k, c.x + dx, y + dy + r * 0.28, r * 1.05, r * 0.85);
+            }
+            for &(dx, dy, r, k) in &c.puffs {
+                rgba(cr, cloud_c, a);
+                self.blobs.paint(cr, k, c.x + dx, y + dy, r, r * 0.8);
             }
         }
+        laps.lap("nubes");
         // Calima y aire vibrando con el calor.
         if hot > 0.0 {
             for i in 0..12 {
@@ -413,11 +502,15 @@ impl Weather {
             cr.fill_q();
         }
 
+        laps.lap("calima");
         // --- Termómetro: escala de 30 a 105 °C con las zonas y los tres sensores.
         let (tx, ty0, ty1) = (w - 60.0 * sc, h * 0.08, h * 0.62);
         let yof = |t: f64| ty1 - (ty1 - ty0) * ((t - T_MIN) / (T_MAX - T_MIN)).clamp(0.0, 1.0);
+        // El panel se ensancha hasta cubrir la etiqueta más larga de los sensores.
+        let label_w = ["CPU", "GPU", "NVME"].iter().map(|n| cr.text_extents(&format!("{n} 100°")).map(|e| e.width()).unwrap_or(60.0)).fold(0.0f64, f64::max);
+        let panel_l = tx - 18.0 - label_w - 10.0;
         rgba(cr, pal.dbg, 0.55);
-        cr.rectangle(tx - 46.0 * sc, ty0 - 14.0, 100.0 * sc, ty1 - ty0 + 28.0 + fs);
+        cr.rectangle(panel_l, ty0 - 14.0, w - 6.0 - panel_l, ty1 - ty0 + 28.0 + fs);
         cr.fill_q();
         for (a, b, c) in [(T_MIN, WARM, pal.blue), (WARM, HOT, pal.yellow), (HOT, CRIT, pal.orange), (CRIT, T_MAX, pal.red)] {
             rgba(cr, c, 0.35);
@@ -533,7 +626,18 @@ impl Weather {
             rgba(cr, pal.heat(self.temp), 1.0);
             cr.set_line_width(1.5);
             cr.stroke_q();
+            // Valor actual al final de la curva.
+            let y = gy + gh - gh * ((self.temp - T_MIN) / (T_MAX - T_MIN)).clamp(0.0, 1.0);
+            cr.set_font_size(fs * 0.9);
+            let txt = format!("{:.0}°", self.temp);
+            if let Ok(e) = cr.text_extents(&txt) {
+                cr.move_to(gx + gw - e.width() - 4.0, (y - 4.0).clamp(gy + fs, gy + gh - 3.0));
+                let _ = cr.show_text(&txt);
+            }
+            cr.set_font_size(fs);
         }
+        laps.lap("paneles");
+        laps.done(60);
     }
 }
 
@@ -563,6 +667,11 @@ pub fn widget(v: Rc<RefCell<Weather>>, pal: Rc<RefCell<Palette>>, font: String) 
     area.add_tick_callback(move |a, clock| {
         let now = clock.frame_time();
         let mut l = last.borrow_mut();
+        if !a.is_mapped() {
+            // Pestaña oculta: ni simulación ni repintado.
+            *l = None;
+            return glib::ControlFlow::Continue;
+        }
         let dt = l.map_or(0.0, |t| (now - t) as f64 / 1e6);
         if l.is_some() && dt < 1.0 / 31.0 {
             return glib::ControlFlow::Continue;

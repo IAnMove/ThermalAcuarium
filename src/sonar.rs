@@ -132,6 +132,20 @@ pub fn floor_path(cr: &Context, t: &Tank) {
     }
 }
 
+/// Barrido del radar: centro (bajo el borde inferior) y ángulo del brazo, en radianes desde las
+/// doce en sentido horario. Da una vuelta cada ~11 s; más deprisa cuando hierve.
+pub fn sweep(t: &Tank) -> (f64, f64, f64) {
+    (t.w * 0.5, t.h * 1.12, (t.t * (0.55 + 0.6 * t.boil)).rem_euclid(2.0 * PI))
+}
+
+/// Eco de un pez: 1 justo cuando el brazo pasa por él, y se apaga en el siguiente cuarto de vuelta.
+pub fn echo(t: &Tank, x: f64, y: f64) -> f64 {
+    let (cx, cy, ang) = sweep(t);
+    let phi = (x - cx).atan2(-(y - cy));
+    let d = (ang - phi).rem_euclid(2.0 * PI);
+    (-d * 2.2).exp()
+}
+
 /// Parpadeo de la pantalla cuando hierve.
 pub fn flicker(t: &Tank) -> f64 {
     1.0 - t.boil * 0.12 * (0.5 + 0.5 * (t.t * 23.0).sin())
@@ -167,6 +181,30 @@ pub fn draw_tank(cr: &Context, v: &View) {
         y += 3.0;
     }
     cr.fill_q();
+    // Anillos de alcance, estela del barrido y brazo.
+    let (cx, cy, ang) = sweep(t);
+    cr.set_line_width(1.0);
+    for k in 1..=4 {
+        let r = h * 1.25 * k as f64 / 4.0;
+        rgba(cr, lc, 0.12);
+        cr.arc(cx, cy, r, 0.0, 2.0 * PI);
+        cr.stroke_q();
+    }
+    let big = h * 1.5;
+    for k in 0..16 {
+        let a0 = ang - PI / 2.0 - (k as f64 + 1.0) * 0.08;
+        let a1 = ang - PI / 2.0 - k as f64 * 0.08;
+        rgba(cr, lc, 0.42 * (1.0 - k as f64 / 16.0));
+        cr.move_to(cx, cy);
+        cr.arc(cx, cy, big, a0, a1 + 0.004);
+        cr.close_path();
+        cr.fill_q();
+    }
+    rgba(cr, lc, 0.9);
+    cr.set_line_width(1.5);
+    cr.move_to(cx, cy);
+    cr.line_to(cx + big * ang.sin(), cy - big * ang.cos());
+    cr.stroke_q();
     // Nieve: puntos tenues.
     for m in &t.motes {
         rgba(cr, lc, 0.08 + 0.25 * m.z);
@@ -211,12 +249,14 @@ pub fn draw_tank(cr: &Context, v: &View) {
     }
     let ds = cr.target().device_scale().0.max(1.0);
     crate::draw::reset_budget();
-    cr.push_group();
+    // Cada pez brilla cuando el brazo lo barre y se va apagando después (su eco).
     for &i in &t.order {
-        crate::draw::fish(cr, &t.fish[i], p, v.hover == Some(Pick::Fish(i)), ds, v.style);
+        let f = &t.fish[i];
+        cr.push_group();
+        crate::draw::fish(cr, f, p, v.hover == Some(Pick::Fish(i)), ds, v.style);
+        let _ = cr.pop_group_to_source();
+        let _ = cr.paint_with_alpha(flicker(t) * (0.55 + 0.45 * echo(t, f.x, f.y)));
     }
-    let _ = cr.pop_group_to_source();
-    let _ = cr.paint_with_alpha(flicker(t));
     // Burbujas: anillos finos.
     cr.set_line_width(1.0);
     for b in &t.bubbles {

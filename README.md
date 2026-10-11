@@ -10,7 +10,7 @@ Built with **Rust** (GTK4 + Libadwaita), themed from the active **Omarchy** them
 | Process RAM | **Body size** (log scale: from a 1 MB plankton to a multi‑GB whale) |
 | Process CPU | **Swim speed** and tail beat |
 | Process disk writes | **Bubbles** from the fish's mouth |
-| Same process name | A **shoal**: one species/colors per name, one fish per PID |
+| Same process name | A **shoal**: one species/colors per name, one fish per PID, swimming in a loose formation (a big shoal is a wide cloud, not a column) |
 | CPU temperature | The water **boils**: bubbling from the sand, glow, foam, agitated fish |
 | System RAM usage | Water gets **murky** when memory is nearly full |
 | Load average | Strength of the **current** (marine snow) |
@@ -87,10 +87,12 @@ Press **`T`** (or click the style button in the header) to cycle; the choice is 
   angelfish, puffer, betta, torpedo, discus) with three tail frames, flat theme colors and a
   one‑pixel ink outline. A process's size is the sprite's integer zoom: a 1 MB process is a 1× fish,
   an 8 GB one is an 8× fish. Bubbles, light shafts and corals share one pixel grid.
-- **Sonar**: the tank as a radar screen. Dark background with a grid and scanlines, every fish a
-  glowing echo (outline with halo, spine and ribs) in one hue of your theme per shoal, protected
-  processes as dim infrastructure, bubbles as rings, the surface and the sand as bright traces. When
-  the CPU boils the whole screen shifts to red and flickers.
+- **Sonar**: the tank as a radar screen. Dark background with a grid, range rings and scanlines, a
+  sweep arm that turns every ~11 s and lights up each fish as it passes (the echo then fades until
+  the next pass), every fish a glowing trace (outline with halo, spine and ribs) in one hue of your
+  theme per shoal, protected processes as dim infrastructure, bubbles as rings, the surface and the
+  sand as bright traces. When the CPU boils the whole screen shifts to red, flickers and the sweep
+  speeds up.
 - **Realistic**: a reef aquarium. 15 species with real anatomy and coloring (clownfish, blue and
   yellow tang, royal gramma, chromis, butterflyfish, angelfish, mandarin dragonet, anthias, cardinalfish,
   damselfish, pufferfish, wrasse, lionfish, grouper) with countershading, scales, fin rays and
@@ -169,6 +171,8 @@ thermalacuarium --snapshot out.png [--style real] [--size 1180x680] [--seconds 8
 thermalacuarium --snapshot gallery.png --gallery --style real --len 210   # all reef species
 thermalacuarium --snapshot gallery.png --gallery --style pixel --len 300  # all pixel species
 thermalacuarium --bench-scene volcano|rivers|weather                       # ms per frame of a tab, no window
+GDK_BACKEND=broadway BROADWAY_DISPLAY=:5 thermalacuarium --bench-gpu --style real   # UI-thread cost per frame of the tank (needs a gtk4-broadwayd :5)
+TA_PROF=1 thermalacuarium                                                  # print per-section frame times to stderr
 thermalacuarium --office           # start in the task-manager view
 thermalacuarium --theme nord       # preview another Omarchy theme (or THERMALACUARIUM_THEME=nord)
 thermalacuarium --new-instance     # open another window without activating the running one
@@ -178,9 +182,16 @@ thermalacuarium --new-instance     # open another window without activating the 
 
 ## How it stays light
 
-Animation is capped at ~30 FPS and stops when the window is hidden. Each fish variant is painted once
-with Cairo into a sprite and GTK composes it on the GPU (transforms, gradients and bubbles are GSK
-nodes), instead of re‑rasterizing the whole tank every frame.
+Animation is capped at ~30 FPS and stops when the window is hidden or the tab is not the visible one.
+Each fish variant is painted once with Cairo into a sprite **on a worker thread**; until it arrives the
+nearest existing sprite of that shoal is shown, so the UI thread never waits for a rasterization. GTK
+composes the sprites on the GPU (transforms, gradients and bubbles are GSK nodes): building a frame of
+180 fish costs about 1 ms of UI-thread time (stylized, sonar, realistic; Pixel a little more). When the
+sprite cache passes 160 MB, sprites unused for 20 s are evicted. Switching to the realistic style or
+resizing it bakes its background layers once (about 100 ms, a single hitch).
+The decoration sways through 16 cached poses, `/proc` is sampled on its own thread, and the volcano,
+rivers and weather scenes bake everything static (terrain, sky, lava halos, tributaries, grass) and
+redraw only what moves (about 2–5 ms per frame each, at 30 FPS).
 
 ## Credits
 

@@ -24,6 +24,64 @@ pub struct View<'a> {
     pub style: Style,
 }
 
+// ---------------------------------------------------------------- perfilado (TA_PROF=1)
+
+thread_local! {
+    static LAPS: RefCell<HashMap<&'static str, (Vec<(&'static str, f64)>, u32)>> = RefCell::new(HashMap::new());
+}
+
+/// Cronómetro por secciones de un fotograma. Con `TA_PROF=1` acumula el tiempo de cada sección y,
+/// cada `every` fotogramas, imprime la media en una sola línea por ámbito. Sin la variable no
+/// cuesta nada más que leer un booleano.
+pub struct Laps {
+    on: bool,
+    scope: &'static str,
+    t: std::time::Instant,
+}
+
+impl Laps {
+    pub fn new(scope: &'static str) -> Laps {
+        Laps { on: std::env::var_os("TA_PROF").is_some(), scope, t: std::time::Instant::now() }
+    }
+
+    pub fn lap(&mut self, name: &'static str) {
+        if !self.on {
+            return;
+        }
+        let ms = self.t.elapsed().as_secs_f64() * 1000.0;
+        self.t = std::time::Instant::now();
+        LAPS.with(|l| {
+            let mut l = l.borrow_mut();
+            let e = l.entry(self.scope).or_default();
+            if let Some(s) = e.0.iter_mut().find(|s| s.0 == name) {
+                s.1 += ms;
+            } else {
+                e.0.push((name, ms));
+            }
+        });
+    }
+
+    /// Cierra el fotograma; imprime cada `every` fotogramas.
+    pub fn done(self, every: u32) {
+        if !self.on {
+            return;
+        }
+        LAPS.with(|l| {
+            let mut l = l.borrow_mut();
+            let e = l.entry(self.scope).or_default();
+            e.1 += 1;
+            if e.1 >= every {
+                let n = e.1 as f64;
+                let total: f64 = e.0.iter().map(|s| s.1).sum();
+                let parts: Vec<String> = e.0.iter().filter(|s| s.1 / n >= 0.05).map(|s| format!("{} {:.2}", s.0, s.1 / n)).collect();
+                eprintln!("{}: {:.2} ms/fotograma · {}", self.scope, total / n, parts.join(" · "));
+                e.0.clear();
+                e.1 = 0;
+            }
+        });
+    }
+}
+
 // ---------------------------------------------------------------- helpers de Cairo
 
 pub(crate) trait Quiet {
@@ -363,7 +421,7 @@ fn blade(cr: &Context, x: f64, y: f64, hgt: f64, wid: f64, sway: f64, col: Rgb) 
 
 #[allow(clippy::too_many_arguments)]
 fn coral_branch(cr: &Context, x: f64, y: f64, ang: f64, len: f64, wid: f64, depth: u32, seed: u64, t: f64, col: Rgb) {
-    let a = ang + (t * 0.7 + depth as f64 * 0.8 + unit(seed) * 6.0).sin() * 0.04;
+    let a = ang + (t + depth as f64 * 0.8 + unit(seed) * 6.0).sin() * 0.04;
     let (nx, ny) = (x + a.cos() * len, y + a.sin() * len);
     rgba(cr, if depth == 0 { lighten(col, 0.3) } else { col }, 0.96);
     cr.set_line_width(wid);
@@ -379,14 +437,39 @@ fn coral_branch(cr: &Context, x: f64, y: f64, ang: f64, len: f64, wid: f64, dept
     }
 }
 
-pub fn decor(cr: &Context, v: &View, d: &Decor, hover: bool) {
-    let t = v.tank;
-    let p = v.pal;
+/// Pose de una pieza de decoración: dónde está, cuánto mide y en qué punto del balanceo va.
+/// `phase` recorre un ciclo completo en 2π, así que una pieza se puede pintar a sprites por fases.
+#[derive(Clone, Copy)]
+pub struct DecorPose {
+    pub x: f64,
+    pub y: f64,
+    pub size: f64,
+    pub phase: f64,
+    /// Agitación del agua (1 en calma, hasta 3.5 hirviendo): amplitud del balanceo.
+    pub agit: f64,
+    pub hover: bool,
+}
+
+/// Fases de balanceo por ciclo con las que se cachea la decoración estilizada (1 = rígida).
+pub fn decor_phases(kind: usize) -> usize {
+    if kind == 3 { 1 } else { 16 }
+}
+
+pub fn decor_pose(t: &Tank, d: &Decor, hover: bool) -> DecorPose {
     let x = d.xf * t.w;
-    let y = t.floor_y(x) + 5.0;
-    let s = d.size;
     let agit = 1.0 + 2.5 * t.boil;
-    let tt = t.t * agit;
+    DecorPose { x, y: t.floor_y(x) + 5.0, size: d.size, phase: (t.t * agit * 0.9).rem_euclid(2.0 * PI), agit, hover }
+}
+
+pub fn decor(cr: &Context, v: &View, d: &Decor, hover: bool) {
+    decor_at(cr, v.pal, d, &decor_pose(v.tank, d, hover));
+}
+
+/// Pinta la pieza `d` en la pose dada (coordenadas absolutas de la pecera).
+pub fn decor_at(cr: &Context, p: &Palette, d: &Decor, pose: &DecorPose) {
+    let (x, y, s) = (pose.x, pose.y, pose.size);
+    let agit = pose.agit;
+    let ph = pose.phase;
     cr.save_q();
     cr.set_line_cap(cairo::LineCap::Round);
     cr.set_line_join(cairo::LineJoin::Round);
@@ -396,7 +479,7 @@ pub fn decor(cr: &Context, v: &View, d: &Decor, hover: bool) {
             for i in 0..n {
                 let k = i as f64 - (n as f64 - 1.0) / 2.0;
                 let hg = s * (0.7 + 0.5 * unit(d.seed + i as u64));
-                let sway = (tt * 0.9 + unit(d.seed + 40 + i as u64) * 6.0).sin() * s * 0.10 * agit.sqrt();
+                let sway = (ph + unit(d.seed + 40 + i as u64) * 6.0).sin() * s * 0.10 * agit.sqrt();
                 let col = mix(p.green, p.cyan, unit(d.seed + 80 + i as u64) * 0.4);
                 blade(cr, x + k * s * 0.13, y, hg, s * 0.045, sway + k * s * 0.06, col);
             }
@@ -407,7 +490,7 @@ pub fn decor(cr: &Context, v: &View, d: &Decor, hover: bool) {
             let n = 2 + (d.seed >> 8) as usize % 2;
             for i in 0..n {
                 let ang = -PI / 2.0 + (i as f64 - (n as f64 - 1.0) / 2.0) * 0.55;
-                coral_branch(cr, x + (i as f64 - 0.5) * s * 0.06, y, ang, s * 0.34, s * 0.075, 3, mix64(d.seed + i as u64), tt, col);
+                coral_branch(cr, x + (i as f64 - 0.5) * s * 0.06, y, ang, s * 0.34, s * 0.075, 3, mix64(d.seed + i as u64), ph, col);
             }
         }
         2 => {
@@ -424,7 +507,7 @@ pub fn decor(cr: &Context, v: &View, d: &Decor, hover: bool) {
             let n = 15;
             for i in 0..n {
                 let a = -0.1 * PI - 0.8 * PI * i as f64 / (n - 1) as f64;
-                let sw = (tt * 1.1 + i as f64 * 0.9).sin() * s * 0.05 * agit.sqrt();
+                let sw = (ph + i as f64 * 0.9).sin() * s * 0.05 * agit.sqrt();
                 let (tx, ty) = (x + a.cos() * s * 0.5 + sw, y + a.sin() * s * 0.78);
                 let wid = (s * 0.04).max(1.5);
                 rgba(cr, darken(col, 0.25), 0.95);
@@ -455,7 +538,7 @@ pub fn decor(cr: &Context, v: &View, d: &Decor, hover: bool) {
             cr.stroke_q();
         }
     }
-    if hover {
+    if pose.hover {
         rgba(cr, p.accent, 0.5);
         cr.set_line_width(1.5);
         cr.rectangle(x - s * 0.4, y - s, s * 0.8, s + 6.0);
@@ -1103,7 +1186,7 @@ fn blit_fish(cr: &Context, f: &Fish, pal: &Palette, ds: f64, style: Style) {
                     return;
                 }
                 _ => {
-                    let spr = render_sprite(f, &key, blen, pal, ds);
+                    let spr = render_sprite(&f.look, f.len, &key, blen, pal, ds);
                     c.bytes += (spr.surf.width() * spr.surf.height() * 4) as usize;
                     c.map.insert(key, spr);
                 }
@@ -1133,8 +1216,8 @@ pub(crate) fn reset_budget() {
     BUDGET.with(|b| b.set(6));
 }
 
-pub fn render_sprite(f: &Fish, key: &SKey, blen: f64, pal: &Palette, ds: f64) -> Sprite {
-    let np = nphases(f.len);
+pub fn render_sprite(look: &Look, len: f64, key: &SKey, blen: f64, pal: &Palette, ds: f64) -> Sprite {
+    let np = nphases(len);
     let style = match key.style {
         2 => Style::Realistic,
         1 => Style::Pixel,
@@ -1142,7 +1225,7 @@ pub fn render_sprite(f: &Fish, key: &SKey, blen: f64, pal: &Palette, ds: f64) ->
         _ => Style::Cartoon,
     };
     let art = FishArt {
-        look: f.look,
+        look: *look,
         len: blen,
         phase: (key.phase as f64 + 0.5) / np as f64 * 2.0 * PI,
         amp: AMPS[key.amp as usize],
@@ -1151,14 +1234,14 @@ pub fn render_sprite(f: &Fish, key: &SKey, blen: f64, pal: &Palette, ds: f64) ->
     };
     // Caja que contiene cuerpo, aletas y la ondulación de la cola.
     if style == Style::Pixel {
-        return crate::pixel::render(&f.look, key.phase as usize, key.size as f64, pal, key.dying);
+        return crate::pixel::render(look, key.phase as usize, key.size as f64, pal, key.dying);
     }
     let (half_w, half_h) = if key.style == 2 {
-        crate::reef::fish::extent(&f.look, blen, art.amp)
+        crate::reef::fish::extent(look, blen, art.amp)
     } else if key.style == 3 {
-        crate::sonar::extent(f.look.species, blen, art.amp)
+        crate::sonar::extent(look.species, blen, art.amp)
     } else {
-        let def = &SPECIES_DEFS[f.look.species];
+        let def = &SPECIES_DEFS[look.species];
         let hh = def.ratio * blen;
         let fin_h = def.dorsal.h.max(def.anal.h) * hh * (1.0 + def.dorsal.lean.max(def.anal.lean) * 0.4);
         ((blen * 0.5 + 6.0), (hh * 1.1 + fin_h + blen * 0.17 * art.amp + 6.0).max(blen * 0.35))

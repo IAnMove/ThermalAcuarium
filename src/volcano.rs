@@ -17,6 +17,7 @@ use crate::draw::{Quiet, lin, rgba};
 use crate::i18n::{tr, trf};
 use crate::reef::noise;
 use crate::sim::Rng;
+use crate::stamps::{ScaledTiles, Stamps};
 use crate::sys::{Group, fmt_bytes};
 use crate::theme::{Palette, Rgb, darken, lighten, mix};
 
@@ -87,11 +88,79 @@ pub struct Volcano {
     cache_key: RefCell<Option<(i32, i32, u64)>>,
     mountain: RefCell<Option<ImageSurface>>,
     section: RefCell<Option<ImageSurface>>,
-    lava_tile: RefCell<Option<ImageSurface>>,
-    blobs: Vec<ImageSurface>,
+    lava_tile: RefCell<Option<ScaledTiles>>,
+    blobs: Stamps,
     /// Cielo con estrellas, horneado por nivel de uso (cambia despacio).
     sky_key: RefCell<Option<i32>>,
     sky: RefCell<Option<ImageSurface>>,
+    /// Sube con cada `set_groups`: invalida las capas horneadas de coladas y fisuras.
+    stamp: u64,
+    /// Coladas y fisuras: todo lo que no es la textura de lava (halo, borde, brillo, etiquetas) se
+    /// hornea una vez; cada fotograma solo se pinta la lava en movimiento a través de una máscara.
+    flow_cache: RefCell<Option<(FlowKey, Baked)>>,
+    swap_cache: RefCell<Option<(FlowKey, Baked)>>,
+}
+
+type FlowKey = (u64, i32, i32, i32, u64);
+
+/// Capas horneadas de un grupo de trazos de lava, recortadas a su caja (`x0`, `y0`). La lava en
+/// movimiento se traza cada fotograma por encima de `under` (son trazos finos: baratos).
+struct Baked {
+    under: ImageSurface,
+    /// Trazos de lava: puntos y anchura (y anchura del hilo brillante del centro, 0 si no hay).
+    strokes: Vec<(Vec<(f64, f64)>, f64, f64)>,
+    /// Etiquetas: texto, x, y (línea base).
+    labels: Vec<(String, f64, f64)>,
+    x0: f64,
+    y0: f64,
+}
+
+impl Baked {
+    fn new(x0: f64, y0: f64, w: f64, h: f64) -> Baked {
+        let under = ImageSurface::create(cairo::Format::ARgb32, w.ceil().max(1.0) as i32, h.ceil().max(1.0) as i32).expect("capa");
+        Baked { under, strokes: vec![], labels: vec![], x0, y0 }
+    }
+
+    /// Contexto de la capa, ya trasladado a coordenadas de la escena.
+    fn cx(&self) -> Context {
+        let c = Context::new(&self.under).expect("cairo");
+        c.translate(-self.x0, -self.y0);
+        c.set_line_cap(cairo::LineCap::Round);
+        c.set_line_join(cairo::LineJoin::Round);
+        c
+    }
+
+    /// Pinta: capa horneada, trazos de lava con su hilo brillante, etiquetas.
+    fn paint(&self, cr: &Context, lava: &cairo::SurfacePattern, hot: Rgb, pal: &Palette, fs: f64) {
+        let path = |cr: &Context, pts: &[(f64, f64)]| {
+            cr.move_to(pts[0].0, pts[0].1);
+            for p in &pts[1..] {
+                cr.line_to(p.0, p.1);
+            }
+        };
+        for (pts, wd, _) in &self.strokes {
+            path(cr, pts);
+            let _ = cr.set_source(lava);
+            cr.set_line_width(*wd);
+            cr.stroke_q();
+        }
+        for (pts, _, hw) in self.strokes.iter().filter(|s| s.2 > 0.0) {
+            path(cr, pts);
+            rgba(cr, hot, 0.55);
+            cr.set_line_width(*hw);
+            cr.stroke_q();
+        }
+        for (txt, x, y) in &self.labels {
+            if let Ok(e) = cr.text_extents(txt) {
+                rgba(cr, pal.dbg, 0.65);
+                cr.rectangle(x - 4.0, y - fs - 1.0, e.width() + 8.0, fs + 6.0);
+                cr.fill_q();
+                rgba(cr, lighten(pal.bfg, 0.1), 1.0);
+                cr.move_to(*x, *y);
+                let _ = cr.show_text(txt);
+            }
+        }
+    }
 }
 
 const MAX_BOMBS: usize = 260;
@@ -157,9 +226,12 @@ impl Volcano {
             mountain: RefCell::new(None),
             section: RefCell::new(None),
             lava_tile: RefCell::new(None),
-            blobs: (0..3).map(|i| noise::blob_tile(96, 1200 + i)).collect(),
+            blobs: Stamps::new(3, 1200),
             sky_key: RefCell::new(None),
             sky: RefCell::new(None),
+            stamp: 0,
+            flow_cache: RefCell::new(None),
+            swap_cache: RefCell::new(None),
         }
     }
 
@@ -189,6 +261,7 @@ impl Volcano {
         sw.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
         sw.truncate(6);
         self.swappers = sw;
+        self.stamp += 1;
     }
 
     // --- geometría
@@ -497,41 +570,127 @@ impl Volcano {
         *self.mountain.borrow_mut() = Some(m);
         *self.section.borrow_mut() = None;
         *self.sky_key.borrow_mut() = None;
-        *self.lava_tile.borrow_mut() = Some(lava_tile(pal));
+        *self.lava_tile.borrow_mut() = Some(ScaledTiles::new(lava_tile(pal)));
     }
 
     /// Pinta una mancha blanda con el color actual, escalada a (rx, ry), con filtro rápido.
-    fn blob(&self, cr: &Context, k: usize, x: f64, y: f64, rx: f64, ry: f64) {
-        let pat = cairo::SurfacePattern::create(&self.blobs[k]);
-        pat.set_filter(cairo::Filter::Fast);
-        let mut m = cairo::Matrix::identity();
-        m.scale(48.0 / rx.max(1.0), 48.0 / ry.max(1.0));
-        m.translate(-x, -y);
-        m.translate(48.0 * rx.max(1.0) / 48.0 * 0.0, 0.0);
-        // La matriz del patrón va de espacio de usuario a espacio del patrón: el centro del blob
-        // (48, 48) debe caer en (x, y).
-        let mut m2 = cairo::Matrix::identity();
-        m2.translate(48.0, 48.0);
-        m2.scale(48.0 / rx.max(1.0), 48.0 / ry.max(1.0));
-        m2.translate(-x, -y);
-        pat.set_matrix(m2);
-        let _ = m;
-        cr.save_q();
-        cr.rectangle(x - rx, y - ry, 2.0 * rx, 2.0 * ry);
-        cr.clip();
-        let _ = cr.mask(&pat);
-        cr.restore_q();
+    /// Geometría de la colada `i`: puntos de la ladera y anchura.
+    fn flow_geometry(&self, i: usize, f: &Flow, act: f64, sc: f64) -> (Vec<(f64, f64)>, f64) {
+        let (px, _) = self.peak();
+        let c = self.crater();
+        let w = self.w;
+        let len = (0.18 + 3.0 * f.share).clamp(0.18, 1.0) * (0.4 + 0.6 * act);
+        let wd = (3.0 + 30.0 * f.share.sqrt()) * sc;
+        let x0 = px - c * (0.6 + 0.9 * i as f64);
+        let x1 = px - (c + (w * 0.46 - c) * len);
+        let n = 28;
+        let pts = (0..=n)
+            .map(|k| {
+                let x = x0 + (x1 - x0) * k as f64 / n as f64;
+                let wig = (noise::fbm1(x * 0.02 + i as f64 * 9.0, 2, 33 + i as u32) - 0.5) * 16.0 * (k as f64 / n as f64);
+                (x, self.slope_y(x + wig) + 1.0)
+            })
+            .collect();
+        (pts, wd)
     }
 
-    fn lava_pattern(&self, tile: &ImageSurface, scale: f64, dx: f64, dy: f64) -> cairo::SurfacePattern {
-        let pat = cairo::SurfacePattern::create(tile);
-        pat.set_extend(cairo::Extend::Repeat);
-        pat.set_filter(cairo::Filter::Fast);
-        let mut m = cairo::Matrix::identity();
-        m.scale(1.0 / scale, 1.0 / scale);
-        m.translate(-dx, -dy);
-        pat.set_matrix(m);
-        pat
+    fn bake_flows(&self, pal: &Palette, font: &str, act: f64, sc: f64, fs: f64) -> Baked {
+        let (px, _) = self.peak();
+        let hz = self.horizon();
+        let c = self.crater();
+        let mut b = Baked::new(0.0, 0.0, px + c + 40.0, hz + 20.0);
+        let under = b.cx();
+        under.select_font_face(font, cairo::FontSlant::Normal, cairo::FontWeight::Bold);
+        under.set_font_size(fs);
+        for (i, f) in self.flows.iter().enumerate() {
+            let (pts, wd) = self.flow_geometry(i, f, act, sc);
+            let n = pts.len() - 1;
+            let path = |cr: &Context| {
+                cr.move_to(pts[0].0, pts[0].1);
+                for p in &pts[1..] {
+                    cr.line_to(p.0, p.1);
+                }
+            };
+            // Halo de calor sobre la roca y borde oscuro de la costra.
+            path(&under);
+            rgba(&under, Self::lava(pal, 0.4), 0.22);
+            under.set_line_width(wd * 2.4);
+            under.stroke_q();
+            path(&under);
+            rgba(&under, (0.1, 0.02, 0.01), 0.55);
+            under.set_line_width(wd + 3.0);
+            under.stroke_q();
+            let txt = format!("{} · {}", f.name, fmt_bytes(f.mem));
+            if let Ok(e) = under.text_extents(&txt) {
+                // Las etiquetas se apilan ladera arriba, una fila por colada.
+                let (lx, ly2) = (pts[n].0 - 8.0, pts[n].1 - 6.0 - i as f64 * (fs + 6.0));
+                b.labels.push((txt, (lx - e.width()).max(4.0), ly2));
+            }
+            b.strokes.push((pts, wd, wd * 0.3));
+        }
+        drop(under);
+        b
+    }
+
+    fn bake_swap(&self, pal: &Palette, font: &str, sc: f64, fs: f64) -> Baked {
+        let (w, h) = (self.w, self.h);
+        let hz = self.horizon();
+        let mut b = Baked::new(0.0, hz, w, h - hz);
+        let under = b.cx();
+        under.select_font_face(font, cairo::FontSlant::Normal, cairo::FontWeight::Bold);
+        under.set_font_size(fs);
+        let ncr = self.swappers.len();
+        let top = self.swappers[0].1.max(1.0);
+        for i in 0..ncr {
+            let (name, bytes) = &self.swappers[i];
+            let sd = i as u32 * 31 + 7;
+            // Repartidas en dos filas para que las etiquetas no se pisen.
+            let x0 = w * (0.06 + 0.9 * ((i as f64 + 0.5) / ncr as f64)) - w * 0.06;
+            let y0 = hz + 16.0 + (i % 2) as f64 * (h - hz - 36.0) * 0.5 + noise::rnd(i as i32, 2, sd) * 10.0;
+            let len = w * (0.05 + 0.16 * (bytes / top).sqrt());
+            let pts: Vec<(f64, f64)> = (0..=8).map(|k| (x0 + len * k as f64 / 8.0, y0 + (noise::rnd(k, i as i32, sd) - 0.5) * 12.0)).collect();
+            let path = |cr: &Context| {
+                cr.move_to(pts[0].0, pts[0].1);
+                for p in &pts[1..] {
+                    cr.line_to(p.0, p.1);
+                }
+            };
+            path(&under);
+            rgba(&under, Self::lava(pal, 0.3), 0.18 + 0.2 * self.swap);
+            under.set_line_width(14.0 * sc);
+            under.stroke_q();
+            path(&under);
+            rgba(&under, (0.05, 0.03, 0.03), 0.9);
+            under.set_line_width(5.0 * sc);
+            under.stroke_q();
+            // Grietas secundarias.
+            rgba(&under, (0.05, 0.03, 0.03), 0.8);
+            under.set_line_width(1.5 * sc);
+            for k in [2usize, 5] {
+                let (bx, by) = pts[k];
+                under.move_to(bx, by);
+                under.line_to(bx + (noise::rnd(k as i32, 9, sd) - 0.5) * 24.0, by + (noise::rnd(k as i32, 10, sd) - 0.5) * 16.0);
+            }
+            under.stroke_q();
+            // Etiqueta: programa y cuánto tiene en swap.
+            let txt = format!("{} · {} swap", name, fmt_bytes(*bytes));
+            if let Ok(e) = under.text_extents(&txt) {
+                let x = (x0 + len / 2.0 - e.width() / 2.0).clamp(6.0, w - e.width() - 6.0);
+                b.labels.push((txt, x, y0 + 12.0 + fs));
+            }
+            b.strokes.push((pts, 2.2 * sc, 0.0));
+        }
+        drop(under);
+        b
+    }
+
+    fn blob(&self, cr: &Context, k: usize, x: f64, y: f64, rx: f64, ry: f64) {
+        self.blobs.paint(cr, k, x, y, rx, ry);
+    }
+
+    /// Patrón de lava a una escala, desplazado (dx, dy) (baldosa pre-escalada: ruta rápida).
+    fn lava_pattern(&self, tile: &ScaledTiles, scale: f64, dx: f64, dy: f64) -> cairo::SurfacePattern {
+        tile.pattern(scale, dx, dy)
     }
 
     pub fn draw(&self, cr: &Context, pal: &Palette, font: &str) {
@@ -554,19 +713,30 @@ impl Volcano {
         let glow = Self::lava(pal, 0.35);
 
         cr.save_q();
-        cr.translate(self.shake.0, self.shake.1);
-        let prof = std::env::var_os("TA_PROF").is_some();
-        let mut tm = std::time::Instant::now();
-        let mut lap = |name: &str| {
-            if prof {
-                eprintln!("  {name}: {:.2} ms", tm.elapsed().as_secs_f64() * 1000.0);
-            }
-            tm = std::time::Instant::now();
-        };
+        // Entero: una traslación fraccionaria obliga a filtrar todas las capas (ruta lenta de Cairo).
+        cr.translate(self.shake.0.round(), self.shake.1.round());
+        let mut laps = crate::draw::Laps::new("volcano");
+        let mut lap = |name: &'static str| laps.lap(name);
 
         lap("sky");
-        // Cielo y estrellas: horneados por nivel de uso (el cielo enrojece con la actividad).
-        let skey = (u * 50.0).round() as i32;
+        // Fondo completo horneado por nivel de uso: cielo, estrellas, resplandor del cráter,
+        // llanura y montaña con su corte. Una sola copia por fotograma.
+        let rock = Self::rock(pal);
+        cr.select_font_face(font, cairo::FontSlant::Normal, cairo::FontWeight::Bold);
+        let fs = (11.0 * sc).clamp(10.0, 14.0);
+        cr.set_font_size(fs);
+        // Coladas y fisuras: su parte fija (halo, borde, grietas) se hornea aparte y se funde en el
+        // fondo; por fotograma solo quedan los trazos de lava y las etiquetas.
+        let pal_h = crate::sim::hash_str(&pal.raw);
+        let fkey: FlowKey = (self.stamp, (act * 40.0).round() as i32, w as i32, h as i32, pal_h);
+        if self.flow_cache.borrow().as_ref().map(|c| c.0) != Some(fkey) {
+            *self.flow_cache.borrow_mut() = Some((fkey, self.bake_flows(pal, font, act, sc, fs)));
+        }
+        let swkey: FlowKey = (self.stamp, (self.swap * 20.0).round() as i32, w as i32, h as i32, pal_h);
+        if self.swap_total > 0.0 && !self.swappers.is_empty() && self.swap_cache.borrow().as_ref().map(|c| c.0) != Some(swkey) {
+            *self.swap_cache.borrow_mut() = Some((swkey, self.bake_swap(pal, font, sc, fs)));
+        }
+        let skey = ((u * 50.0).round() as i32) ^ (((self.cache * 50.0).round() as i32) << 8) ^ ((self.stamp as i32) << 16) ^ (((self.swap * 20.0).round() as i32) << 12);
         if *self.sky_key.borrow() != Some(skey) || self.sky.borrow().is_none() {
             let s = ImageSurface::create(cairo::Format::ARgb32, (w + 20.0).ceil() as i32, (h + 20.0).ceil() as i32).expect("sky");
             {
@@ -579,8 +749,58 @@ impl Volcano {
                 for i in 0..90u64 {
                     let (x, y) = (noise::rnd(i as i32, 1, 1) * w, noise::rnd(i as i32, 2, 1) * hz * 0.7);
                     rgba(c, pal.bfg, (0.15 + 0.5 * noise::rnd(i as i32, 3, 1)) * (1.0 - 0.7 * act));
-                    c.rectangle(x.round(), y.round(), 1.5, 1.5);
+                    let r = if noise::rnd(i as i32, 4, 1) > 0.85 { 2.2 } else { 1.5 };
+                    c.rectangle(x.round(), y.round(), r, r);
                     c.fill_q();
+                }
+                // Resplandor del cráter sobre el cielo: una mancha blanda escalada.
+                let glow_r = w * (0.22 + 0.4 * act + 0.3 * erupt);
+                rgba(c, glow, 0.30 + 0.45 * act);
+                self.blob(c, 0, px, py, glow_r, glow_r);
+                // Llanura.
+                let _ = c.set_source(lin(0.0, hz, 0.0, h, &[(0.0, mix(rock, pal.bg, 0.3), 1.0), (1.0, darken(pal.dbg, 0.3), 1.0)]));
+                c.rectangle(0.0, hz, w, h - hz);
+                c.fill_q();
+                // Montaña y corte, con el resplandor de la lava sobre la roca de la cumbre.
+                if let Some(m) = self.mountain.borrow().as_ref() {
+                    let _ = c.set_source_surface(m, 0.0, 0.0);
+                    c.paint_q();
+                }
+                if act > 0.0 || erupt > 0.0 {
+                    rgba(c, glow, 0.35 * act + 0.3 * erupt);
+                    self.blob(c, 1, px, py + 20.0 * sc, w * (0.14 + 0.25 * act), w * (0.10 + 0.18 * act));
+                }
+                let cra = self.crater();
+                // Nieve de la cumbre (exterior): la memoria libre.
+                let free = (1.0 - u - self.cache).clamp(0.0, 1.0);
+                let snow_h = (hz - py) * 0.4 * free.powf(1.2);
+                if snow_h > 2.0 {
+                    let ys = py + snow_h;
+                    let mut x = px - cra;
+                    c.move_to(px, py);
+                    c.line_to(px - cra, self.slope_y(px - cra));
+                    while self.slope_y(x) < ys && x > 0.0 {
+                        c.line_to(x, self.slope_y(x));
+                        x -= 4.0;
+                    }
+                    let xl = x;
+                    let mut xx = xl;
+                    while xx <= px {
+                        let jag = (noise::fbm1(xx * 0.05, 2, 21) - 0.5) * snow_h * 0.35;
+                        c.line_to(xx, (ys + jag).max(self.slope_y(xx)));
+                        xx += 6.0;
+                    }
+                    c.close_path();
+                    let snow = mix((0.96, 0.97, 1.0), pal.bfg, 0.2);
+                    let _ = c.set_source(lin(0.0, py, 0.0, ys, &[(0.0, snow, 0.95), (1.0, mix(snow, pal.dbg, 0.35), 0.9)]));
+                    c.fill_q();
+                }
+
+                for cache in [&self.flow_cache, &self.swap_cache] {
+                    if let Some((_, b)) = cache.borrow().as_ref() {
+                        let _ = c.set_source_surface(&b.under, b.x0, b.y0);
+                        c.paint_q();
+                    }
                 }
             }
             *self.sky.borrow_mut() = Some(s);
@@ -590,19 +810,14 @@ impl Volcano {
             let _ = cr.set_source_surface(s, -10.0, -10.0);
             cr.paint_q();
         }
-        // Resplandor del cráter: una mancha blanda escalada (ni círculo ni degradado caro).
-        let glow_r = w * (0.22 + 0.4 * act + 0.3 * erupt) * (0.97 + 0.03 * (self.t * 2.0).sin());
-        rgba(cr, glow, 0.30 + 0.45 * act);
-        self.blob(cr, 0, px, py, glow_r, glow_r);
+        lap("fondo");
+        // Latido del resplandor: una mancha pequeña y tenue encima (la grande ya está en el fondo).
+        if act > 0.0 {
+            let glow_r = w * (0.12 + 0.2 * act) * (0.9 + 0.1 * (self.t * 2.0).sin());
+            rgba(cr, glow, 0.10 * act * (0.5 + 0.5 * (self.t * 2.0).sin()));
+            self.blob(cr, 0, px, py, glow_r, glow_r);
+        }
 
-        lap("stars+glow");
-        // Llanura.
-        let rock = Self::rock(pal);
-        let _ = cr.set_source(lin(0.0, hz, 0.0, h, &[(0.0, mix(rock, pal.bg, 0.3), 1.0), (1.0, darken(pal.dbg, 0.3), 1.0)]));
-        cr.rectangle(0.0, hz, w, h - hz);
-        cr.fill_q();
-
-        lap("plain");
         // --- Interior del corte: magma dentro de la cámara.
         let ly = self.level_y(u);
         let cy = self.level_y((u + self.cache).min(1.0));
@@ -658,96 +873,18 @@ impl Volcano {
         cr.fill_q();
         cr.restore_q();
 
+        // Borde de la cavidad por encima del magma (la montaña está debajo, en el fondo horneado).
+        self.chamber_path(cr);
+        rgba(cr, (0.0, 0.0, 0.0), 0.55);
+        cr.set_line_width(4.0);
+        cr.stroke_q();
+
         lap("magma");
-        // Capas estáticas.
-        if let Some(m) = self.mountain.borrow().as_ref() {
-            let _ = cr.set_source_surface(m, 0.0, 0.0);
-            cr.paint_q();
-        }
-        if act > 0.0 || erupt > 0.0 {
-            rgba(cr, glow, 0.35 * act + 0.3 * erupt);
-            self.blob(cr, 1, px, py + 20.0 * sc, w * (0.14 + 0.25 * act), w * (0.10 + 0.18 * act));
-        }
-
-        lap("static+glow");
-        // Nieve de la cumbre (exterior): la memoria libre.
-        let free = (1.0 - u - self.cache).clamp(0.0, 1.0);
-        let snow_h = (hz - py) * 0.4 * free.powf(1.2);
-        if snow_h > 2.0 {
-            let ys = py + snow_h;
-            let mut x = px - c;
-            cr.move_to(px, py);
-            cr.line_to(px - c, self.slope_y(px - c));
-            while self.slope_y(x) < ys && x > 0.0 {
-                cr.line_to(x, self.slope_y(x));
-                x -= 4.0;
-            }
-            let xl = x;
-            let mut xx = xl;
-            while xx <= px {
-                let jag = (noise::fbm1(xx * 0.05, 2, 21) - 0.5) * snow_h * 0.35;
-                cr.line_to(xx, (ys + jag).max(self.slope_y(xx)));
-                xx += 6.0;
-            }
-            cr.close_path();
-            let snow = mix((0.96, 0.97, 1.0), pal.bfg, 0.2);
-            let _ = cr.set_source(lin(0.0, py, 0.0, ys, &[(0.0, snow, 0.95), (1.0, mix(snow, pal.dbg, 0.35), 0.9)]));
-            cr.fill_q();
-        }
-
-        lap("snow");
-        // Coladas (exterior): los programas que más RAM usan, con textura de lava.
-        cr.set_line_cap(cairo::LineCap::Round);
-        cr.set_line_join(cairo::LineJoin::Round);
-        cr.select_font_face(font, cairo::FontSlant::Normal, cairo::FontWeight::Bold);
-        let fs = (11.0 * sc).clamp(10.0, 14.0);
-        cr.set_font_size(fs);
-        for (i, f) in self.flows.iter().enumerate() {
-            let len = (0.18 + 3.0 * f.share).clamp(0.18, 1.0) * (0.4 + 0.6 * act);
-            let wd = (3.0 + 30.0 * f.share.sqrt()) * sc;
-            let x0 = px - c * (0.6 + 0.9 * i as f64);
-            let x1 = px - (c + (w * 0.46 - c) * len);
-            let n = 28;
-            let pts: Vec<(f64, f64)> = (0..=n)
-                .map(|k| {
-                    let x = x0 + (x1 - x0) * k as f64 / n as f64;
-                    let wig = (noise::fbm1(x * 0.02 + i as f64 * 9.0, 2, 33 + i as u32) - 0.5) * 16.0 * (k as f64 / n as f64);
-                    (x, self.slope_y(x + wig) + 1.0)
-                })
-                .collect();
-            let path = |cr: &Context| {
-                cr.move_to(pts[0].0, pts[0].1);
-                for p in &pts[1..] {
-                    cr.line_to(p.0, p.1);
-                }
-            };
-            path(cr);
-            rgba(cr, Self::lava(pal, 0.4), 0.22);
-            cr.set_line_width(wd * 2.4);
-            cr.stroke_q();
-            path(cr);
-            rgba(cr, (0.1, 0.02, 0.01), 0.55);
-            cr.set_line_width(wd + 3.0);
-            cr.stroke_q();
-            path(cr);
-            let _ = cr.set_source(self.lava_pattern(tile, 0.9 * sc, -self.t * 20.0, self.t * 12.0));
-            cr.set_line_width(wd);
-            cr.stroke_q();
-            path(cr);
-            rgba(cr, Self::lava(pal, 0.05), 0.55);
-            cr.set_line_width(wd * 0.3);
-            cr.stroke_q();
-            let txt = format!("{} · {}", f.name, fmt_bytes(f.mem));
-            if let Ok(e) = cr.text_extents(&txt) {
-                // Las etiquetas se apilan ladera arriba, una fila por colada.
-                let (lx, ly2) = (pts[n].0 - 8.0, pts[n].1 - 6.0 - i as f64 * (fs + 6.0));
-                let x = (lx - e.width()).max(4.0);
-                rgba(cr, pal.dbg, 0.65);
-                cr.rectangle(x - 4.0, ly2 - fs - 1.0, e.width() + 8.0, fs + 6.0);
-                cr.fill_q();
-                rgba(cr, lighten(pal.bfg, 0.1), 1.0);
-                cr.move_to(x, ly2);
-                let _ = cr.show_text(&txt);
+        // Coladas (exterior): los programas que más RAM usan, con textura de lava. Todo lo que
+        // no se mueve (halo, borde, brillo, etiquetas) está horneado; aquí solo se pinta la lava.
+        {
+            if let Some((_, b)) = self.flow_cache.borrow().as_ref() {
+                b.paint(cr, &self.lava_pattern(tile, 0.9 * sc, -self.t * 20.0, self.t * 12.0), Self::lava(pal, 0.05), pal, fs);
             }
         }
 
@@ -830,61 +967,11 @@ impl Volcano {
         }
 
         lap("smoke");
-        // Swap: la llanura se agrieta y por las fisuras asoma el magma. Cuantas más y más largas,
-        // más swap en uso.
-        // Una fisura por programa (las más largas, los que más swap tienen), con su etiqueta.
-        let ncr = self.swappers.len();
-        if self.swap_total > 0.0 && ncr > 0 {
-            cr.set_line_cap(cairo::LineCap::Round);
-            cr.set_line_join(cairo::LineJoin::Round);
-            let top = self.swappers[0].1.max(1.0);
-            for i in 0..ncr {
-                let (name, bytes) = &self.swappers[i];
-                let sd = i as u32 * 31 + 7;
-                // Repartidas en dos filas para que las etiquetas no se pisen.
-                let x0 = w * (0.06 + 0.9 * ((i as f64 + 0.5) / ncr as f64)) - w * 0.06;
-                let y0 = hz + 16.0 + (i % 2) as f64 * (h - hz - 36.0) * 0.5 + noise::rnd(i as i32, 2, sd) * 10.0;
-                let len = w * (0.05 + 0.16 * (bytes / top).sqrt());
-                let pts: Vec<(f64, f64)> = (0..=8).map(|k| (x0 + len * k as f64 / 8.0, y0 + (noise::rnd(k, i as i32, sd) - 0.5) * 12.0)).collect();
-                let path = |cr: &Context| {
-                    cr.move_to(pts[0].0, pts[0].1);
-                    for p in &pts[1..] {
-                        cr.line_to(p.0, p.1);
-                    }
-                };
-                path(cr);
-                rgba(cr, Self::lava(pal, 0.3), 0.18 + 0.2 * self.swap);
-                cr.set_line_width(14.0 * sc);
-                cr.stroke_q();
-                path(cr);
-                rgba(cr, (0.05, 0.03, 0.03), 0.9);
-                cr.set_line_width(5.0 * sc);
-                cr.stroke_q();
-                path(cr);
-                let _ = cr.set_source(self.lava_pattern(tile, 0.6 * sc, self.t * 5.0, 0.0));
-                cr.set_line_width(2.2 * sc);
-                cr.stroke_q();
-                rgba(cr, (0.05, 0.03, 0.03), 0.8);
-                cr.set_line_width(1.5 * sc);
-                for k in [2usize, 5] {
-                    let (bx, by) = pts[k];
-                    cr.move_to(bx, by);
-                    cr.line_to(bx + (noise::rnd(k as i32, 9, sd) - 0.5) * 24.0, by + (noise::rnd(k as i32, 10, sd) - 0.5) * 16.0);
-                }
-                cr.stroke_q();
-                // Etiqueta: programa y cuánto tiene en swap.
-                let txt = format!("{} · {} swap", name, fmt_bytes(*bytes));
-                cr.set_font_size(fs);
-                if let Ok(e) = cr.text_extents(&txt) {
-                    let x = (x0 + len / 2.0 - e.width() / 2.0).clamp(6.0, w - e.width() - 6.0);
-                    let y = y0 + 12.0 + fs;
-                    rgba(cr, pal.dbg, 0.65);
-                    cr.rectangle(x - 4.0, y - fs - 1.0, e.width() + 8.0, fs + 6.0);
-                    cr.fill_q();
-                    rgba(cr, lighten(pal.bfg, 0.1), 1.0);
-                    cr.move_to(x, y);
-                    let _ = cr.show_text(&txt);
-                }
+        // Swap: la llanura se agrieta y por las fisuras asoma el magma. Una fisura por programa
+        // (las más largas, los que más swap tienen), con su etiqueta; horneadas salvo la lava.
+        if self.swap_total > 0.0 && !self.swappers.is_empty() {
+            if let Some((_, b)) = self.swap_cache.borrow().as_ref() {
+                b.paint(cr, &self.lava_pattern(tile, 0.6 * sc, self.t * 5.0, 0.0), Self::lava(pal, 0.05), pal, fs);
             }
         }
 
@@ -989,6 +1076,9 @@ impl Volcano {
             let _ = cr.show_text(l);
         }
         cr.restore_q();
+        lap("textos");
+        drop(lap);
+        laps.done(60);
     }
 }
 
@@ -1019,6 +1109,11 @@ pub fn widget(v: Rc<RefCell<Volcano>>, pal: Rc<RefCell<Palette>>, font: String) 
     area.add_tick_callback(move |a, clock| {
         let now = clock.frame_time();
         let mut l = last.borrow_mut();
+        if !a.is_mapped() {
+            // Pestaña oculta: ni simulación ni repintado.
+            *l = None;
+            return glib::ControlFlow::Continue;
+        }
         let dt = l.map_or(0.0, |t| (now - t) as f64 / 1e6);
         if l.is_some() && dt < 1.0 / 31.0 {
             return glib::ControlFlow::Continue;

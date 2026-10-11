@@ -231,7 +231,7 @@ pub fn render(widget: &gtk::Widget, snap: &gtk::Snapshot, v: &View, cache: &mut 
     }
     put(snap, &cache.real.glass, stretch);
 
-    crate::gpu::labels(snap, widget, v);
+    crate::gpu::labels(snap, widget, v, cache);
 }
 
 /// Cáusticas: la baldosa se repite a dos escalas y rumbos, y una máscara de alfa (roca y arena, con

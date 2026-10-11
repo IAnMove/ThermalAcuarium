@@ -10,8 +10,10 @@ mod pixel;
 mod reef;
 mod rivers;
 mod sonar;
+mod stamps;
 mod volcano;
 mod weather;
+mod worker;
 mod sim;
 mod sys;
 mod theme;
@@ -538,21 +540,42 @@ fn build_ui(app: &adw::Application) {
 
     // Dibujo: el árbol de nodos GSK de cada fotograma (la GPU compone, ver gpu.rs).
     let md = m.clone();
+    let prof = std::env::var_os("TA_PROF").is_some();
+    let acc: Rc<RefCell<(f64, f64, u32)>> = Rc::new(RefCell::new((0.0, 0.0, 0)));
     area.set_render(move |w, snap| {
+        let t0 = std::time::Instant::now();
         let mut guard = md.borrow_mut();
         let m = &mut *guard;
         m.tank.resize(WidgetExt::width(w) as f64, WidgetExt::height(w) as f64);
         let v = View { tank: &m.tank, pal: &m.pal, font: &m.font, hover: m.hover, names: m.names, paused: m.paused, style: m.style };
         gpu::render(w.upcast_ref(), snap, &v, &mut m.gpu);
+        if prof {
+            let ms = t0.elapsed().as_secs_f64() * 1000.0;
+            let mut a = acc.borrow_mut();
+            a.0 += ms;
+            a.1 = a.1.max(ms);
+            a.2 += 1;
+            if a.2 == 30 {
+                eprintln!("tank nodes: {:.2} ms/frame · max {:.1} ms · {} fish · {} sprites · {} pending", a.0 / 30.0, a.1, m.tank.fish.len(), m.gpu.sprite_count(), m.gpu.pending_count());
+                *a = (0.0, 0.0, 0);
+            }
+        }
     });
 
     // Reloj de animación: sincronizado con el frame clock y limitado a ~30 FPS para no gastar CPU.
     let u = ui.clone();
-    area.add_tick_callback(move |_, clock| {
+    let ticks: Rc<std::cell::Cell<u32>> = Rc::new(std::cell::Cell::new(0));
+    area.add_tick_callback(move |a, clock| {
         let now = clock.frame_time();
+        if prof {
+            ticks.set(ticks.get() + 1);
+            if ticks.get() % 120 == 0 {
+                eprintln!("tank tick: mapped={}", a.is_mapped());
+            }
+        }
         {
             let mut m = u.m.borrow_mut();
-            if m.paused {
+            if m.paused || !a.is_mapped() {
                 m.last_frame = None;
                 return glib::ControlFlow::Continue;
             }
@@ -820,15 +843,83 @@ fn bench_scene(which: &str) {
     };
     draw(&cr, 0.0); // hornea las capas estáticas
     let t0 = std::time::Instant::now();
-    for _ in 0..40 {
+    for _ in 0..120 {
         draw(&cr, 1.0 / 30.0);
     }
-    eprintln!("{which}: {:.1} ms/fotograma", t0.elapsed().as_secs_f64() * 1000.0 / 40.0);
+    eprintln!("{which}: {:.1} ms/fotograma", t0.elapsed().as_secs_f64() * 1000.0 / 120.0);
+}
+
+/// `--bench-gpu [--style S] [--names N] [--temp T]`: mide el coste en CPU de construir el árbol de
+/// nodos GSK de cada fotograma (lo que hace el hilo de la interfaz en la ventana real), sin
+/// ventana. Necesita un backend de GDK (p. ej. `GDK_BACKEND=broadway` con un broadwayd en marcha).
+fn bench_gpu() {
+    if gtk::init().is_err() {
+        eprintln!("bench-gpu: no hay pantalla; usa GDK_BACKEND=broadway BROADWAY_DISPLAY=:5 con gtk4-broadwayd");
+        return;
+    }
+    let (w, h) = (1180.0, 680.0);
+    let pal = Palette::load();
+    let font = current_font();
+    let style = start_style();
+    let names = arg_val("--names").and_then(|s| s.parse().ok()).unwrap_or(0);
+    let mut tank = Tank::new(w, h, 0xC0FFEE);
+    let mut sys = SysSampler::default();
+    let mut procs = ProcSampler::new();
+    procs.sample();
+    sys.sample();
+    std::thread::sleep(Duration::from_millis(600));
+    let s = sys.sample();
+    let r = Sensors::new().read();
+    tank.set_env(demo_temp().or(r.cpu), r.load / ncpu(), s.ram_used, s.ram_total, s.disk_w);
+    tank.sync(&procs.sample(), true);
+    tank.demo_randomize();
+    let widget = gpu::TankWidget::new();
+    let mut cache = gpu::GpuCache::default();
+    let mut times = vec![];
+    let mut steps = vec![];
+    let paced = !has_flag("--unpaced");
+    for _ in 0..360 {
+        let frame0 = std::time::Instant::now();
+        let t = std::time::Instant::now();
+        tank.step(1.0 / 30.0);
+        steps.push(t.elapsed().as_secs_f64() * 1000.0);
+        let v = View { tank: &tank, pal: &pal, font: &font, hover: None, names, paused: false, style };
+        let t = std::time::Instant::now();
+        let snap = gtk::Snapshot::new();
+        gpu::render(widget.upcast_ref(), &snap, &v, &mut cache);
+        let node = snap.to_node();
+        times.push(t.elapsed().as_secs_f64() * 1000.0);
+        drop(node);
+        // Al ritmo de la ventana (30 FPS), para que el hilo de sprites trabaje como en la app.
+        if paced {
+            let left = Duration::from_millis(33).saturating_sub(frame0.elapsed());
+            std::thread::sleep(left);
+        }
+    }
+    let avg = |r: &[f64]| r.iter().sum::<f64>() / r.len() as f64;
+    let max = |r: &[f64]| r.iter().cloned().fold(0.0, f64::max);
+    eprintln!(
+        "bench-gpu {:?}: nodos {:.2} ms/fotograma (primeros 60: {:.2} · máx {:.1}) · régimen {:.2} ms (máx {:.1}) · paso {:.2} ms · {} peces · {} burbujas · {} sprites",
+        style,
+        avg(&times),
+        avg(&times[..60]),
+        max(&times[..60]),
+        avg(&times[120..]),
+        max(&times[120..]),
+        avg(&steps[120..]),
+        tank.fish.len(),
+        tank.bubbles.len(),
+        cache.sprite_count()
+    );
 }
 
 fn main() -> glib::ExitCode {
     if let Some(which) = arg_val("--bench-scene") {
         bench_scene(&which);
+        return glib::ExitCode::SUCCESS;
+    }
+    if has_flag("--bench-gpu") {
+        bench_gpu();
         return glib::ExitCode::SUCCESS;
     }
     if let Some(p) = arg_val("--snapshot") {

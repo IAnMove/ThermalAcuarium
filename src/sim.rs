@@ -168,6 +168,9 @@ pub struct Fish {
     pub amp: f64,
     phase0: f64,
     yoff: f64,
+    /// Puesto dentro del banco: la formación (una espiral de girasol, alargada en el sentido de
+    /// nado) sale de él, así que un banco grande es una nube ancha y no una columna.
+    slot: usize,
     speed_var: f64,
     pub life: Life,
     pub alpha: f64,
@@ -479,6 +482,11 @@ impl Tank {
             )
         };
         let phase0 = self.rng.range(0.0, 2.0 * PI);
+        let slot = {
+            let mut used: Vec<usize> = self.fish.iter().filter(|f| f.kh == kh).map(|f| f.slot).collect();
+            used.sort_unstable();
+            used.iter().enumerate().find(|(i, s)| *i != **s).map_or(used.len(), |(i, _)| i)
+        };
         self.fish.push(Fish {
             pid: p.pid,
             start: p.start,
@@ -504,7 +512,8 @@ impl Tank {
             phase: phase0,
             amp: 0.5,
             phase0,
-            yoff: self.rng.gauss() * len * (0.6 + 0.3 * (shoal as f64).sqrt()),
+            yoff: self.rng.gauss() * len * 0.25,
+            slot,
             speed_var: self.rng.range(0.85, 1.2),
             life: Life::Alive,
             alpha,
@@ -677,9 +686,18 @@ impl Tank {
                         g.dir
                     };
                     let mut dvx = dirx * speed;
+                    // Puesto en la formación del banco: espiral de girasol, estirada a lo largo.
+                    let (ox, oy) = if g.n > 1 {
+                        let lavg = g.lsum / g.n as f64;
+                        let r = 0.55 * lavg * (f.slot as f64).sqrt();
+                        let th = f.slot as f64 * 2.399_963;
+                        (r * th.cos() * 1.8, r * th.sin() * 0.7)
+                    } else {
+                        (0.0, 0.0)
+                    };
                     if g.n > 1 {
                         let lim = 0.6 * speed + 20.0;
-                        dvx += ((g.cx - f.x) * 0.5).clamp(-lim, lim);
+                        dvx += ((g.cx + ox - f.x) * 0.5).clamp(-lim, lim);
                     }
                     let mut dvy = 0.0;
                     for &(kh, x, y, l) in &snap {
@@ -699,7 +717,7 @@ impl Tank {
                     let lm = f.len * 0.5 + 8.0;
                     dvx += (lm - f.x).max(0.0) * 2.5 - (f.x - (w - lm)).max(0.0) * 2.5;
                     let yf = g.yf + (0.14 - g.yf) * 0.35 * b;
-                    let ty = top + (bot - top) * yf + f.yoff;
+                    let ty = (top + (bot - top) * yf + oy + f.yoff).clamp(top, bot);
                     let lim = 0.5 * speed + 10.0;
                     dvy += ((ty - f.y) * 0.9).clamp(-lim, lim);
                     dvy += (self.t * 0.8 + f.phase0).sin() * (6.0 + 28.0 * b)

@@ -10,13 +10,14 @@ use std::cell::RefCell;
 use std::f64::consts::PI;
 use std::rc::Rc;
 
-use gtk::cairo::{self, Context, ImageSurface, RadialGradient};
+use gtk::cairo::{self, Context, ImageSurface};
 use gtk::glib;
 use gtk::prelude::*;
 
 use crate::draw::{Quiet, lin, rgba};
 use crate::reef::noise;
 use crate::sim::Rng;
+use crate::stamps::{ScaledTiles, Stamps};
 use crate::sys::{Disk, Group, fmt_bytes};
 use crate::theme::{Palette, Rgb, darken, lighten, mix};
 
@@ -39,6 +40,19 @@ pub struct River {
     level_goal: f64,
 }
 
+/// Un afluente ya trazado.
+struct TribPath {
+    pts: Vec<(f64, f64)>,
+    tw: f64,
+    act: f64,
+    write: bool,
+    name: String,
+    bps: f64,
+    side: f64,
+    spring: (f64, f64),
+    conf: (f64, f64),
+}
+
 struct Drop {
     x: f64,
     y: f64,
@@ -58,7 +72,13 @@ pub struct Rivers {
     rng: Rng,
     cache_key: RefCell<Option<(i32, i32, u64, usize)>>,
     terrain: RefCell<Option<ImageSurface>>,
-    water_tile: RefCell<Option<ImageSurface>>,
+    water_tile: RefCell<Option<ScaledTiles>>,
+    /// La misma baldosa, más tenue, para el embalse.
+    water_tile2: RefCell<Option<ScaledTiles>>,
+    /// Afluentes horneados (todo menos la corriente que se mueve).
+    trib_cache: RefCell<Option<((u64, i32, i32, i32, u64), ImageSurface)>>,
+    stamp: u64,
+    blobs: Stamps,
 }
 
 /// Caudal (bytes/s) → 0–1 en escala logarítmica (1 KB/s → 0, 1 GB/s → 1).
@@ -101,6 +121,10 @@ impl Rivers {
             cache_key: RefCell::new(None),
             terrain: RefCell::new(None),
             water_tile: RefCell::new(None),
+            water_tile2: RefCell::new(None),
+            trib_cache: RefCell::new(None),
+            stamp: 0,
+            blobs: Stamps::new(2, 2600),
         }
     }
 
@@ -139,6 +163,7 @@ impl Rivers {
         v.sort_by(|a, b| b.bps.partial_cmp(&a.bps).unwrap_or(std::cmp::Ordering::Equal));
         v.truncate(6);
         self.tribs = v;
+        self.stamp += 1;
     }
 
     pub fn resize(&mut self, w: f64, h: f64) {
@@ -241,21 +266,29 @@ impl Rivers {
         mix((0.14, 0.42, 0.60), mix(pal.blue, pal.cyan, 0.5), 0.3)
     }
 
-    /// Mapa de alturas de la meseta: colinas con los valles de los ríos excavados.
+    /// Mapa de alturas de la meseta: colinas con los valles de los ríos excavados. El ruido se
+    /// muestrea en un espacio en perspectiva (lejos las colinas se ven más pequeñas) con la misma
+    /// escala en x y en y, para que el relieve no salga a rayas.
     fn height(&self, x: f64, y: f64, rivers: &[Vec<(f64, f64)>]) -> f64 {
-        let u = ((y - self.sky_y()) / (self.cliff_y() - self.sky_y())).clamp(0.0, 1.0);
-        // Más lejos (arriba) el relieve se ve más pequeño: frecuencia mayor.
-        let f = 1.0 + 2.5 * (1.0 - u);
-        let base = noise::fbm(x / self.w * 5.0 * f, y / self.h * 7.0 * f, 4, 404, 0);
-        let mut h = 0.35 + 0.65 * base;
+        let l = (self.cliff_y() - self.sky_y()).max(1.0);
+        let v = (y - self.sky_y()).clamp(0.0, l);
+        let u = v / l;
+        // Profundidad: factor de 2.2 en el horizonte a 1 en el borde; integrado en y para que la
+        // coordenada sea monótona.
+        let f = 1.0 + 1.2 * (1.0 - u);
+        let wy = v + 1.2 * (v - v * v / (2.0 * l));
+        let wx = (x - self.w / 2.0) * f;
+        let cell = 150.0;
+        let base = noise::fbm(wx / cell, wy / cell, 4, 404, 0);
+        let fine = noise::fbm(wx / (cell * 0.35) + 7.0, wy / (cell * 0.35), 2, 405, 0);
+        let mut h = 0.30 + 0.60 * base + 0.14 * (fine - 0.5);
         for r in rivers {
             let d = dist_poly(x, y, r);
-            let valley = (1.0 - (d / (self.w * 0.08)).min(1.0)).powi(2);
+            let valley = (1.0 - (d / (self.w * 0.085)).min(1.0)).powi(2);
             h -= 0.55 * valley;
         }
         h
     }
-
 
     /// Lecho del río (orillas, grava y piedras): estático, se hornea con el terreno.
     fn draw_bed(&self, cr: &Context, i: usize, pal: &Palette, tile: &ImageSurface) {
@@ -329,11 +362,11 @@ impl Rivers {
                 for px in 0..pw as usize {
                     let (x, y) = (px as f64 * q, sy + py as f64 * q);
                     let hc = self.height(x, y, &rivers);
-                    let hx = self.height(x + q, y, &rivers);
-                    let hy = self.height(x, y + q, &rivers);
-                    let (dx, dy) = ((hx - hc) * 40.0, (hy - hc) * 40.0);
+                    let hx = self.height(x + 2.0 * q, y, &rivers);
+                    let hy = self.height(x, y + 2.0 * q, &rivers);
+                    let (dx, dy) = ((hx - hc) * 22.0, (hy - hc) * 22.0);
                     let slope = (dx * dx + dy * dy).sqrt();
-                    let shade = (0.62 + 0.55 * (-dx * lx - dy * ly).clamp(-0.6, 0.8)).clamp(0.25, 1.25);
+                    let shade = (0.60 + 0.75 * (-dx * lx - dy * ly).clamp(-0.6, 0.8)).clamp(0.22, 1.30);
                     let dmin = rivers.iter().map(|r| dist_poly(x, y, r)).fold(f64::MAX, f64::min);
                     let fnoise = noise::fbm(x / w * 9.0, y / h * 12.0, 3, 808, 0);
                     let mut c = mix(grass, dry, ((hc - 0.45) / 0.5).clamp(0.0, 1.0));
@@ -381,6 +414,55 @@ impl Rivers {
         cr.source().set_filter(cairo::Filter::Bilinear);
         cr.paint_q();
         cr.restore_q();
+        // Grano de la pradera a resolución completa (hierba, matorral) y bosquecillos en las
+        // manchas oscuras, más pequeños cuanto más lejos.
+        {
+            let gtile = noise::grey_tile(256, 40, 3, 516, 1.5);
+            let gpat = cairo::SurfacePattern::create(&gtile);
+            gpat.set_extend(cairo::Extend::Repeat);
+            cr.save_q();
+            cr.rectangle(0.0, sy, w, cy - sy);
+            cr.clip();
+            cr.set_operator(cairo::Operator::SoftLight);
+            let _ = cr.set_source(&gpat);
+            let _ = cr.paint_with_alpha(0.45);
+            cr.set_operator(cairo::Operator::Over);
+            cr.restore_q();
+            let mut trees: Vec<(f64, f64, f64)> = vec![];
+            for i in 0..900u64 {
+                let x = noise::rnd(i as i32, 1, 611) * w;
+                let u = noise::rnd(i as i32, 2, 611);
+                let y = sy + (cy - sy) * (0.08 + 0.9 * u * u);
+                let fnoise = noise::fbm(x / w * 9.0, y / h * 12.0, 3, 808, 0);
+                let dmin = rivers.iter().map(|r| dist_poly(x, y, r)).fold(f64::MAX, f64::min);
+                if fnoise > 0.57 && dmin > w * 0.045 && self.height(x, y, &rivers) < 0.9 {
+                    let s = (1.6 + 5.5 * ((y - sy) / (cy - sy))) * (0.7 + 0.6 * noise::rnd(i as i32, 3, 611));
+                    trees.push((x, y, s));
+                }
+            }
+            trees.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal));
+            for (x, y, s) in trees {
+                // Sombra, copa y luz: tres triángulos (abetos vistos de lejos).
+                rgba(cr, darken(forest, 0.5), 0.6);
+                cr.move_to(x + s * 0.3, y + 1.0);
+                cr.line_to(x + s * 1.3, y + 1.0);
+                cr.line_to(x + s * 0.5, y - s * 0.6);
+                cr.close_path();
+                cr.fill_q();
+                rgba(cr, darken(forest, 0.25), 1.0);
+                cr.move_to(x - s * 0.55, y);
+                cr.line_to(x + s * 0.55, y);
+                cr.line_to(x, y - s * 1.6);
+                cr.close_path();
+                cr.fill_q();
+                rgba(cr, lighten(forest, 0.25), 0.9);
+                cr.move_to(x - s * 0.5, y - s * 0.1);
+                cr.line_to(x, y - s * 0.2);
+                cr.line_to(x, y - s * 1.55);
+                cr.close_path();
+                cr.fill_q();
+            }
+        }
         let wtile = noise::grey_tile(256, 12, 3, 515, 1.6);
         for i in 0..self.lanes() {
             self.draw_bed(cr, i, pal, &wtile);
@@ -422,9 +504,30 @@ impl Rivers {
         let dw = self.dam_w();
         for i in 0..self.lanes() {
             let (x0, x1) = self.lane_x(i);
-            let _ = cr.set_source(lin(0.0, bt, 0.0, bb, &[(0.0, darken(rock, 0.45), 1.0), (1.0, darken(rock, 0.8), 1.0)]));
+            // Vaso del embalse: pared de roca con estratos, más oscura hacia el fondo.
+            let _ = cr.set_source(lin(0.0, bt, 0.0, bb, &[(0.0, darken(rock, 0.2), 1.0), (1.0, darken(rock, 0.65), 1.0)]));
             cr.rectangle(x0, bt, x1 - x0, bb - bt);
             cr.fill_q();
+            cr.save_q();
+            cr.rectangle(x0, bt, x1 - x0, bb - bt);
+            cr.clip();
+            cr.set_operator(cairo::Operator::SoftLight);
+            let _ = cr.set_source(&pat);
+            let _ = cr.paint_with_alpha(0.7);
+            cr.set_operator(cairo::Operator::Over);
+            for k in 0..6u64 {
+                let yy = bt + (bb - bt) * (k as f64 + 0.5) / 6.0;
+                rgba(cr, darken(rock, 0.7), 0.3);
+                cr.set_line_width(1.0 + noise::rnd(k as i32, 3, 72));
+                cr.move_to(x0, yy);
+                let mut x = x0;
+                while x <= x1 {
+                    cr.line_to(x, yy + (noise::fbm1(x * 0.02 + k as f64 * 3.0, 2, 72) - 0.5) * 6.0);
+                    x += 8.0;
+                }
+                cr.stroke_q();
+            }
+            cr.restore_q();
             // Orilla izquierda de roca.
             rgba(cr, darken(rock, 0.3), 1.0);
             cr.move_to(x0, bt);
@@ -455,7 +558,99 @@ impl Rivers {
         cr.rectangle(0.0, bb, w, h - bb);
         cr.fill_q();
         *self.terrain.borrow_mut() = Some(surf);
-        *self.water_tile.borrow_mut() = Some(wtile);
+        *self.water_tile2.borrow_mut() = Some(ScaledTiles::new(noise::with_alpha(&wtile, 0.18)));
+        *self.water_tile.borrow_mut() = Some(ScaledTiles::new(noise::with_alpha(&wtile, 0.35)));
+    }
+
+    /// Geometría de los afluentes del río `i`: trazado, anchura, actividad, manantial y confluencia.
+    fn trib_paths(&self, i: usize) -> Vec<TribPath> {
+        let Some(r) = self.rivers.get(i) else { return vec![] };
+        let (x0, x1) = self.lane_x(i);
+        let dw = self.dam_w();
+        let sc = (self.w / 1000.0).max(0.6);
+        let pts = self.river_pts(i);
+        let n = pts.len();
+        let hw = |k: usize| self.half_at(i, k as f64 / (n - 1) as f64);
+        let my_tribs: Vec<&Tributary> = self.tribs.iter().enumerate().filter(|(k, _)| k % self.lanes() == i).map(|(_, t)| t).collect();
+        my_tribs
+            .iter()
+            .enumerate()
+            .map(|(k, t)| {
+                let side = if k % 2 == 0 { -1.0 } else { 1.0 };
+                let u = 0.22 + 0.62 * (k as f64 + 0.5) / my_tribs.len().max(1) as f64;
+                let j = ((n - 1) as f64 * u) as usize;
+                let (jx, jy) = (pts[j].0 + side * hw(j) * r.level, pts[j].1);
+                // Manantial: en el borde del carril, más arriba que la confluencia.
+                let sx = if side < 0.0 { x0 + 18.0 + 30.0 * noise::rnd(k as i32, 4, 40 + i as u32) } else { x1 - dw - 18.0 - 30.0 * noise::rnd(k as i32, 4, 40 + i as u32) };
+                let sy = (jy - (70.0 + 90.0 * noise::rnd(k as i32, 5, 40 + i as u32)) * sc).max(self.sky_y() + 30.0);
+                let m = 18;
+                let spts: Vec<(f64, f64)> = (0..=m)
+                    .map(|q| {
+                        let v = q as f64 / m as f64;
+                        // Curva suave con un meandro, que se endereza al llegar al río.
+                        let x = sx + (jx - sx) * (v * v * (3.0 - 2.0 * v)) + (noise::fbm1(v * 3.0 + k as f64 * 5.0, 2, 90 + i as u32) - 0.5) * 36.0 * sc * (1.0 - v) * v.sqrt();
+                        let y = sy + (jy - sy) * v + (noise::fbm1(v * 2.0 + k as f64 * 7.0, 2, 95 + i as u32) - 0.5) * 20.0 * sc * (1.0 - v);
+                        (x, y)
+                    })
+                    .collect();
+                let act = flow01(t.bps);
+                TribPath { pts: spts, tw: (2.0 + 9.0 * act) * sc, act, write: t.write, name: t.name.clone(), bps: t.bps, side, spring: (sx, sy), conf: (jx, jy) }
+            })
+            .collect()
+    }
+
+    /// Capa de los afluentes: lecho de grava, orilla húmeda, agua, espuma de la confluencia y etiqueta.
+    fn bake_tribs(&self, pal: &Palette, font: &str, fs: f64, sc: f64) -> ImageSurface {
+        let (w, cy) = (self.w, self.cliff_y());
+        let surf = ImageSurface::create(cairo::Format::ARgb32, w.ceil() as i32, (cy + 4.0).ceil() as i32).expect("afluentes");
+        let cr = &Context::new(&surf).expect("cairo");
+        cr.select_font_face(font, cairo::FontSlant::Normal, cairo::FontWeight::Bold);
+        cr.set_font_size(fs);
+        cr.set_line_cap(cairo::LineCap::Round);
+        cr.set_line_join(cairo::LineJoin::Round);
+        let water = Self::water(pal);
+        let foam = mix((0.93, 0.97, 1.0), pal.bfg, 0.2);
+        let dw = self.dam_w();
+        for i in 0..self.lanes() {
+            let (x0, x1) = self.lane_x(i);
+            for tb in self.trib_paths(i) {
+                let path = |cr: &Context| {
+                    cr.move_to(tb.pts[0].0, tb.pts[0].1);
+                    for p in &tb.pts[1..] {
+                        cr.line_to(p.0, p.1);
+                    }
+                };
+                let col = if tb.write { mix(water, foam, 0.25) } else { water };
+                for (wd, c, a) in [
+                    (tb.tw + 7.0 * sc, (0.20, 0.16, 0.11), 0.6),
+                    (tb.tw + 4.0 * sc, mix((0.66, 0.60, 0.48), mix(pal.dfg, pal.bg, 0.4), 0.3), 1.0),
+                    (tb.tw + 1.5, darken(col, 0.45), 1.0),
+                    (tb.tw, col, 1.0),
+                ] {
+                    path(cr);
+                    rgba(cr, c, a);
+                    cr.set_line_width(wd);
+                    cr.stroke_q();
+                }
+                // Espuma en la confluencia.
+                rgba(cr, foam, 0.35 + 0.3 * tb.act);
+                self.blobs.paint(cr, 1, tb.conf.0, tb.conf.1, tb.tw * 0.9 + 4.0, tb.tw * 0.7 + 3.0);
+                // Etiqueta junto al manantial.
+                let txt = format!("{} {} {}/s", if tb.write { "↑" } else { "↓" }, tb.name, fmt_bytes(tb.bps));
+                if let Ok(e) = cr.text_extents(&txt) {
+                    let (sx, sy) = tb.spring;
+                    let x = if tb.side < 0.0 { (sx - 6.0).max(x0 + 4.0) } else { (sx + 6.0 - e.width()).min(x1 - dw - e.width() - 4.0) };
+                    let y = sy - 8.0;
+                    rgba(cr, pal.dbg, 0.65);
+                    cr.rectangle(x - 4.0, y - fs - 1.0, e.width() + 8.0, fs + 6.0);
+                    cr.fill_q();
+                    rgba(cr, lighten(pal.bfg, 0.1), 1.0);
+                    cr.move_to(x, y);
+                    let _ = cr.show_text(&txt);
+                }
+            }
+        }
+        surf
     }
 
     pub fn draw(&self, cr: &Context, pal: &Palette, font: &str) {
@@ -467,6 +662,9 @@ impl Rivers {
         }
         let tile_ref = self.water_tile.borrow();
         let Some(tile) = tile_ref.as_ref() else { return };
+        let tile2_ref = self.water_tile2.borrow();
+        let Some(tile2) = tile2_ref.as_ref() else { return };
+        let mut laps = crate::draw::Laps::new("rivers");
         let water = Self::water(pal);
         let foam = mix((0.93, 0.97, 1.0), pal.bfg, 0.2);
         let sc = (w / 1000.0).max(0.6);
@@ -480,16 +678,19 @@ impl Rivers {
             let _ = cr.set_source_surface(t, 0.0, 0.0);
             cr.paint_q();
         }
-        let water_pat = |scale: f64, dx: f64, dy: f64| {
-            let p = cairo::SurfacePattern::create(tile);
-            p.set_extend(cairo::Extend::Repeat);
-            p.set_filter(cairo::Filter::Fast);
-            let mut m = cairo::Matrix::identity();
-            m.scale(1.0 / scale, 1.0 / scale);
-            m.translate(-dx, -dy);
-            p.set_matrix(m);
-            p
-        };
+        {
+            let lv: i32 = self.rivers.iter().map(|r| (r.level * 200.0) as i32).sum();
+            let key = (self.stamp, lv, w as i32, h as i32, crate::sim::hash_str(&pal.raw));
+            if self.trib_cache.borrow().as_ref().map(|c| c.0) != Some(key) {
+                *self.trib_cache.borrow_mut() = Some((key, self.bake_tribs(pal, font, fs, sc)));
+            }
+            if let Some((_, layer)) = self.trib_cache.borrow().as_ref() {
+                let _ = cr.set_source_surface(layer, 0.0, 0.0);
+                cr.paint_q();
+            }
+        }
+        laps.lap("fondo");
+        let water_pat = |scale: f64, dx: f64, dy: f64| tile.pattern(scale, dx, dy);
 
         for (i, r) in self.rivers.iter().enumerate() {
             let (x0, x1) = self.lane_x(i);
@@ -522,10 +723,11 @@ impl Rivers {
                 poly(cr, &|k| wleft(k) + 1.5, &|k| wright(k) - 1.5);
                 let _ = cr.set_source(lin(0.0, self.sky_y(), 0.0, cy, &[(0.0, lighten(water, 0.35), 1.0), (1.0, water, 1.0)]));
                 cr.fill_keep();
+                // Textura del agua en movimiento (baldosa con el alfa ya horneado: un relleno más).
+                let _ = cr.set_source(&water_pat(0.8 * sc, 0.0, self.t * (25.0 + 160.0 * r.flow)));
+                cr.fill_keep();
                 cr.save_q();
                 cr.clip();
-                let _ = cr.set_source(&water_pat(0.8 * sc, 0.0, self.t * (25.0 + 160.0 * r.flow)));
-                let _ = cr.paint_with_alpha(0.35);
                 // Estelas de corriente: su velocidad es la actividad del disco.
                 for s_ in 0..4 {
                     let f = 0.15 + 0.7 * s_ as f64 / 3.0;
@@ -550,7 +752,19 @@ impl Rivers {
                     cr.set_line_width(1.2);
                     cr.stroke_q();
                 }
+                // Destellos del sol sobre el agua, que bajan con la corriente.
+                let sd = 500 + i as u32;
+                for q in 0..16 {
+                    let drift = (noise::rnd(q, 1, sd) + self.t * 0.03 * (1.0 + 4.0 * r.flow)).rem_euclid(1.0);
+                    let kk = ((n - 1) as f64 * drift) as usize;
+                    let x = wleft(kk) + (wright(kk) - wleft(kk)) * (0.15 + 0.7 * noise::rnd(q, 2, sd));
+                    let a = (self.t * 2.5 + q as f64 * 1.7).sin().max(0.0).powi(3) * (0.4 + 0.5 * drift);
+                    rgba(cr, foam, a);
+                    cr.rectangle(x.round(), pts[kk].1.round(), 2.0 + 2.0 * drift, 1.0);
+                    cr.fill_q();
+                }
             }
+            laps.lap("agua");
             // Regla a lo ancho del cauce, al borde del acantilado: 0 % en la orilla izquierda, 100 % en la derecha.
             let ey = pts[n - 1].1;
             let (gx0, gy) = (left(n - 1), ey - 18.0 * sc);
@@ -612,82 +826,32 @@ impl Rivers {
                 }
             }
 
-            // Afluentes: arroyos que nacen en la ladera y serpentean hasta la orilla del agua. Los de
-            // la izquierda llegan a la orilla izquierda, los de la derecha a la derecha.
-            let my_tribs: Vec<&Tributary> = self.tribs.iter().enumerate().filter(|(k, _)| k % self.lanes() == i).map(|(_, t)| t).collect();
-            for (k, t) in my_tribs.iter().enumerate() {
-                let side = if k % 2 == 0 { -1.0 } else { 1.0 };
-                let u = 0.22 + 0.62 * (k as f64 + 0.5) / my_tribs.len().max(1) as f64;
-                let j = ((n - 1) as f64 * u) as usize;
-                let (jx, jy) = (if side < 0.0 { wleft(j) } else { wright(j) }, pts[j].1);
-                // Manantial: en el borde del carril, más arriba que la confluencia.
-                let sx = if side < 0.0 { x0 + 18.0 + 30.0 * noise::rnd(k as i32, 4, 40 + i as u32) } else { x1 - dw - 18.0 - 30.0 * noise::rnd(k as i32, 4, 40 + i as u32) };
-                let sy = (jy - (70.0 + 90.0 * noise::rnd(k as i32, 5, 40 + i as u32)) * sc).max(self.sky_y() + 30.0);
-                let m = 18;
-                let spts: Vec<(f64, f64)> = (0..=m)
-                    .map(|q| {
-                        let v = q as f64 / m as f64;
-                        // Curva suave con un meandro, que se endereza al llegar al río.
-                        let x = sx + (jx - sx) * (v * v * (3.0 - 2.0 * v)) + (noise::fbm1(v * 3.0 + k as f64 * 5.0, 2, 90 + i as u32) - 0.5) * 36.0 * sc * (1.0 - v) * v.sqrt();
-                        let y = sy + (jy - sy) * v + (noise::fbm1(v * 2.0 + k as f64 * 7.0, 2, 95 + i as u32) - 0.5) * 20.0 * sc * (1.0 - v);
-                        (x, y)
-                    })
-                    .collect();
-                let path = |cr: &Context, inset: f64| {
-                    cr.move_to(spts[0].0, spts[0].1);
-                    for p in &spts[1..] {
-                        cr.line_to(p.0 + inset, p.1);
+            laps.lap("regla");
+            // Afluentes: lo fijo (lecho, agua, espuma, etiqueta) viene horneado en una capa; aquí
+            // solo se dibuja la corriente que corre.
+            for tb in self.trib_paths(i) {
+                let path = |cr: &Context| {
+                    cr.move_to(tb.pts[0].0, tb.pts[0].1);
+                    for p in &tb.pts[1..] {
+                        cr.line_to(p.0, p.1);
                     }
                 };
-                let act = flow01(t.bps);
-                let tw = (2.0 + 9.0 * act) * sc;
-                let col = if t.write { mix(water, foam, 0.25) } else { water };
-                // Lecho del arroyo (grava y orilla húmeda), agua y brillo.
-                path(cr, 0.0);
-                rgba(cr, (0.20, 0.16, 0.11), 0.6);
-                cr.set_line_width(tw + 7.0 * sc);
-                cr.stroke_q();
-                path(cr, 0.0);
-                rgba(cr, mix((0.66, 0.60, 0.48), mix(pal.dfg, pal.bg, 0.4), 0.3), 1.0);
-                cr.set_line_width(tw + 4.0 * sc);
-                cr.stroke_q();
-                path(cr, 0.0);
-                rgba(cr, darken(col, 0.45), 1.0);
-                cr.set_line_width(tw + 1.5);
-                cr.stroke_q();
-                path(cr, 0.0);
-                rgba(cr, col, 1.0);
-                cr.set_line_width(tw);
-                cr.stroke_q();
-                path(cr, 0.0);
-                rgba(cr, foam, 0.25 + 0.35 * act);
-                cr.set_line_width((tw * 0.35).max(0.8));
-                cr.set_dash(&[6.0, 14.0], -self.t * (30.0 + 160.0 * act));
+                path(cr);
+                rgba(cr, foam, 0.25 + 0.35 * tb.act);
+                cr.set_line_width((tb.tw * 0.35).max(0.8));
+                cr.set_dash(&[6.0, 14.0], -self.t * (30.0 + 160.0 * tb.act));
                 cr.stroke_q();
                 cr.set_dash(&[], 0.0);
-                // Espuma en la confluencia.
-                rgba(cr, foam, 0.35 + 0.3 * act);
-                cr.arc(jx, jy, tw * 0.9 + 2.0, 0.0, 2.0 * PI);
-                cr.fill_q();
-                // Etiqueta junto al manantial.
-                let txt = format!("{} {} {}/s", if t.write { "↑" } else { "↓" }, t.name, fmt_bytes(t.bps));
-                if let Ok(e) = cr.text_extents(&txt) {
-                    let x = if side < 0.0 { (sx - 6.0).max(x0 + 4.0) } else { (sx + 6.0 - e.width()).min(x1 - dw - e.width() - 4.0) };
-                    let y = sy - 8.0;
-                    rgba(cr, pal.dbg, 0.65);
-                    cr.rectangle(x - 4.0, y - fs - 1.0, e.width() + 8.0, fs + 6.0);
-                    cr.fill_q();
-                    rgba(cr, lighten(pal.bfg, 0.1), 1.0);
-                    cr.move_to(x, y);
-                    let _ = cr.show_text(&txt);
-                }
             }
-
-            // Embalse.
+            laps.lap("afluentes");
+            // Embalse: marca de humedad en la pared justo sobre el nivel, y el agua.
             let lvl = bt + (bb - bt) * (1.0 - r.level);
             let fx = pts[n - 1].0;
             let _ = shift;
             let xr = x1 - dw;
+            let _ = cr.set_source(lin(0.0, lvl - 16.0 * sc, 0.0, lvl, &[(0.0, (0.0, 0.0, 0.0), 0.0), (1.0, (0.0, 0.0, 0.0), 0.45)]));
+            cr.rectangle(x0, (lvl - 16.0 * sc).max(bt), xr - x0, (16.0 * sc).min(lvl - bt).max(0.0));
+            cr.fill_q();
             let _ = cr.set_source(lin(0.0, lvl, 0.0, bb, &[(0.0, lighten(water, 0.15), 1.0), (0.4, water, 1.0), (1.0, darken(water, 0.6), 1.0)]));
             cr.rectangle(x0, lvl, xr - x0, bb - lvl);
             cr.fill_q();
@@ -697,8 +861,9 @@ impl Rivers {
             // Reflejo de la pared y de la cascada, y ondas.
             let _ = cr.set_source(lin(0.0, lvl, 0.0, lvl + (bb - lvl) * 0.5, &[(0.0, darken(water, 0.3), 0.5), (1.0, darken(water, 0.3), 0.0)]));
             cr.paint_q();
-            let _ = cr.set_source(&water_pat(2.2 * sc, self.t * 10.0, self.t * 3.0));
-            let _ = cr.paint_with_alpha(0.18);
+            let _ = cr.set_source(&tile2.pattern(2.2 * sc, self.t * 10.0, self.t * 3.0));
+            cr.rectangle(x0, lvl, xr - x0, bb - lvl);
+            cr.fill_q();
             for k in 0..7 {
                 let yy = lvl + (bb - lvl) * (0.08 + 0.13 * k as f64);
                 rgba(cr, lighten(water, 0.55), 0.10 + 0.12 * (self.t * 1.5 + k as f64).sin().abs());
@@ -711,11 +876,9 @@ impl Rivers {
                 }
                 cr.stroke_q();
             }
-            let g = RadialGradient::new(fx, lvl, 0.0, fx, lvl, (40.0 + 60.0 * r.flow) * sc);
-            g.add_color_stop_rgba(0.0, foam.0, foam.1, foam.2, 0.45 * r.flow + 0.1);
-            g.add_color_stop_rgba(1.0, foam.0, foam.1, foam.2, 0.0);
-            let _ = cr.set_source(&g);
-            cr.paint_q();
+            rgba(cr, foam, 0.45 * r.flow + 0.1);
+            let fr = (40.0 + 60.0 * r.flow) * sc;
+            self.blobs.paint(cr, 0, fx, lvl, fr, fr * 0.55);
             cr.restore_q();
             rgba(cr, lighten(water, 0.6), 0.8);
             cr.set_line_width(1.5);
@@ -727,6 +890,7 @@ impl Rivers {
             }
             cr.stroke_q();
 
+            laps.lap("embalse");
             // Cascada: chorros verticales con la textura cayendo, ensanchándose, y bruma al pie.
             let fw = (ww * 0.9).max(2.0);
             let _ = r.fall;
@@ -736,11 +900,11 @@ impl Rivers {
             cr.line_to(fx + fw * 0.8, lvl + 4.0);
             cr.line_to(fx - fw * 0.8, lvl + 4.0);
             cr.close_path();
-            cr.clip();
             let _ = cr.set_source(lin(fx - fw * 0.8, 0.0, fx + fw * 0.8, 0.0, &[(0.0, water, 0.0), (0.25, foam, 0.8), (0.5, lighten(water, 0.4), 0.95), (0.75, foam, 0.8), (1.0, water, 0.0)]));
-            cr.paint_q();
+            cr.fill_keep();
             let _ = cr.set_source(&water_pat(0.5 * sc, 0.0, self.t * (150.0 + 350.0 * r.fall)));
-            let _ = cr.paint_with_alpha(0.4);
+            cr.fill_keep();
+            cr.clip();
             for k in 0..5 {
                 let xx = fx + (k as f64 - 2.0) * fw * 0.18;
                 rgba(cr, foam, 0.25 + 0.2 * ((self.t * 7.0 + k as f64).sin()).abs());
@@ -750,12 +914,14 @@ impl Rivers {
                 cr.stroke_q();
             }
             cr.restore_q();
-            let g = RadialGradient::new(fx, lvl, 0.0, fx, lvl, (34.0 + 70.0 * r.flow) * sc);
-            g.add_color_stop_rgba(0.0, foam.0, foam.1, foam.2, 0.6 * (0.3 + 0.7 * r.flow));
-            g.add_color_stop_rgba(1.0, foam.0, foam.1, foam.2, 0.0);
-            let _ = cr.set_source(&g);
-            cr.arc(fx, lvl, (34.0 + 70.0 * r.flow) * sc, 0.0, 2.0 * PI);
-            cr.fill_q();
+            // Bruma al pie de la cascada: dos manchas blandas que respiran.
+            let fr = (34.0 + 70.0 * r.flow) * sc;
+            for (k, ph) in [(0usize, 0.0), (1usize, 2.1)] {
+                let br = fr * (0.9 + 0.12 * (self.t * 1.3 + ph).sin());
+                rgba(cr, foam, 0.42 * (0.3 + 0.7 * r.flow));
+                self.blobs.paint(cr, k, fx + (k as f64 - 0.5) * fr * 0.3, lvl - fr * 0.15, br, br * 0.7);
+            }
+            laps.lap("cascada");
 
             // Escala de la presa (0–100 % de ocupación) y marcador.
             let xs = xr;
@@ -816,11 +982,18 @@ impl Rivers {
                 }
             }
         }
-        for d in &self.drops {
-            rgba(cr, foam, d.life.min(1.0) * 0.85);
-            cr.arc(d.x, d.y, 1.4 * sc, 0.0, 2.0 * PI);
+        laps.lap("textos");
+        // Salpicaduras: en tres tandas de opacidad, un solo relleno por tanda.
+        for (lo, hi, a) in [(0.0, 0.35, 0.3), (0.35, 0.7, 0.6), (0.7, 9.0, 0.85)] {
+            rgba(cr, foam, a);
+            for d in self.drops.iter().filter(|d| d.life >= lo && d.life < hi) {
+                cr.new_sub_path();
+                cr.arc(d.x, d.y, 1.4 * sc, 0.0, 2.0 * PI);
+            }
             cr.fill_q();
         }
+        laps.lap("gotas");
+        laps.done(60);
         let _ = h;
     }
 }
@@ -851,6 +1024,11 @@ pub fn widget(v: Rc<RefCell<Rivers>>, pal: Rc<RefCell<Palette>>, font: String) -
     area.add_tick_callback(move |a, clock| {
         let now = clock.frame_time();
         let mut l = last.borrow_mut();
+        if !a.is_mapped() {
+            // Pestaña oculta: ni simulación ni repintado.
+            *l = None;
+            return glib::ControlFlow::Continue;
+        }
         let dt = l.map_or(0.0, |t| (now - t) as f64 / 1e6);
         if l.is_some() && dt < 1.0 / 31.0 {
             return glib::ControlFlow::Continue;

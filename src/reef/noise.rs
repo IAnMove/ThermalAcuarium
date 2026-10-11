@@ -168,3 +168,16 @@ pub fn blob_tile(size: i32, seed: u32) -> cairo::ImageSurface {
     }
     surf
 }
+
+/// Copia de una baldosa opaca con un alfa uniforme (premultiplicado): rellenar con ella es una
+/// composición normal, sin `paint_with_alpha` ni recortes.
+pub fn with_alpha(src: &cairo::ImageSurface, alpha: f64) -> cairo::ImageSurface {
+    let (w, h) = (src.width(), src.height());
+    let surf = cairo::ImageSurface::create(cairo::Format::ARgb32, w, h).expect("alpha tile");
+    {
+        let cr = cairo::Context::new(&surf).expect("cairo");
+        let _ = cr.set_source_surface(src, 0.0, 0.0);
+        let _ = cr.paint_with_alpha(alpha);
+    }
+    surf
+}

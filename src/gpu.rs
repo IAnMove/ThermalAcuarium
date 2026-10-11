@@ -16,9 +16,10 @@ use gtk::subclass::prelude::*;
 use gtk::{gdk, glib, graphene, gsk, pango};
 
 use crate::draw::{self, SKey, View};
-use crate::sim::{BubbleKind, Life, Pick};
 use crate::reef::gpu_scene::RealGpu;
+use crate::sim::{BubbleKind, Life, Pick};
 use crate::theme::{Rgb, Style, lighten, mix};
+use crate::worker::{Job, Worker};
 
 // ---------------------------------------------------------------- widget
 
@@ -89,35 +90,139 @@ struct GpuSprite {
     ox: f32,
     oy: f32,
     len: f64,
+    /// Último fotograma en que se usó y lo que ocupa, para expulsar los que llevan tiempo sin usarse.
+    used: u32,
+    bytes: usize,
 }
 
 struct DecorTex {
     tex: gdk::MemoryTexture,
-    rect: graphene::Rect,
+    w: f32,
+    h: f32,
+    ox: f32,
+    oy: f32,
+    /// Tamaño con el que se pintó.
+    size: f64,
+}
+
+/// Clave de un sprite de decoración estilizada: pieza, tamaño (cubo), fase del balanceo y agitación.
+#[derive(Clone, Copy, PartialEq, Eq, Hash)]
+struct DKey {
+    kind: u8,
+    seed: u64,
+    size: i16,
+    phase: u8,
+    agit: u8,
+}
+
+/// Familia de un sprite de pez: todo menos tamaño, fase y amplitud (los sustitutos válidos).
+type Family = (u8, u8, u8, u8, i8, bool, u8);
+
+fn family(k: &SKey) -> Family {
+    (k.species, k.pattern, k.c1, k.c2, k.tint, k.dying, k.style)
 }
 
 #[derive(Default)]
 pub struct GpuCache {
     pal: String,
+    font: String,
     ds: f64,
     size: (i32, i32),
     sprites: HashMap<SKey, GpuSprite>,
+    /// Sprites que existen, por familia: para elegir rápido el sustituto más parecido.
+    index: HashMap<Family, Vec<SKey>>,
+    /// Pedidos al hilo de sprites y en qué fotograma se pidieron.
+    pending: HashMap<SKey, u32>,
+    worker: Option<Worker>,
+    /// Sube cada vez que se vacía la caché: los sprites de otra generación se descartan.
+    era: u32,
+    frame: u32,
     bytes: usize,
     rays: Option<gdk::MemoryTexture>,
     scan: Option<gdk::MemoryTexture>,
     caustic: Option<gdk::MemoryTexture>,
     sand: Option<(gdk::MemoryTexture, f32)>,
-    decor: Vec<DecorTex>,
-    decor_stamp: i64,
+    /// Agua del estilo Pixel (franjas y tramado), por tono.
+    pixel_water: Option<(i32, gdk::MemoryTexture)>,
+    decor: HashMap<DKey, DecorTex>,
+    decor_budget: u32,
+    layouts: HashMap<(String, u32), pango::Layout>,
     budget: u32,
     style: Option<Style>,
     /// Capas y sprites del estilo realista.
     pub(crate) real: RealGpu,
 }
 
+impl GpuCache {
+    pub fn sprite_count(&self) -> usize {
+        self.sprites.len()
+    }
+
+    pub fn pending_count(&self) -> usize {
+        self.pending.len()
+    }
+
+    fn clear_sprites(&mut self) {
+        self.sprites.clear();
+        self.index.clear();
+        self.pending.clear();
+        self.decor.clear();
+        self.bytes = 0;
+        self.era = self.era.wrapping_add(1);
+    }
+
+    fn worker(&mut self, pal: &crate::theme::Palette, ds: f64) -> &Worker {
+        self.worker.get_or_insert_with(|| Worker::spawn(pal, ds))
+    }
+
+    fn insert_sprite(&mut self, key: SKey, tex: gdk::MemoryTexture, wp: i32, hp: i32, ox: f64, oy: f64, len: f64, ds: f64) {
+        let bytes = (wp * hp * 4) as usize;
+        self.bytes += bytes;
+        // Los sprites de píxeles no llevan escala de dispositivo: se amplían por su factor entero.
+        let k = if key.style == 1 { key.size as f64 } else { 1.0 / ds };
+        self.sprites.insert(key, GpuSprite { tex, w: (wp as f64 * k) as f32, h: (hp as f64 * k) as f32, ox: ox as f32, oy: oy as f32, len, used: self.frame, bytes });
+        self.index.entry(family(&key)).or_default().push(key);
+    }
+
+    /// Si la caché pesa demasiado, suelta los sprites que llevan más de 20 s sin usarse (y, si no
+    /// basta, lo vacía todo).
+    fn evict(&mut self) {
+        if self.bytes <= MAX_SPRITE_BYTES {
+            return;
+        }
+        let frame = self.frame;
+        self.sprites.retain(|_, s| frame.wrapping_sub(s.used) < 600);
+        self.bytes = self.sprites.values().map(|s| s.bytes).sum();
+        self.index.clear();
+        for k in self.sprites.keys() {
+            self.index.entry(family(k)).or_default().push(*k);
+        }
+        if self.bytes > MAX_SPRITE_BYTES {
+            self.clear_sprites();
+        }
+    }
+
+    /// Recoge los sprites que el hilo haya terminado.
+    fn collect(&mut self, ds: f64) {
+        let Some(w) = &self.worker else { return };
+        let done = w.poll();
+        if !done.is_empty() && std::env::var_os("TA_PROF").is_some() {
+            let ok = done.iter().filter(|d| d.era == self.era).count();
+            eprintln!("sprites: {} recibidos ({} de esta era) · {} pendientes · era {}", done.len(), ok, self.pending.len(), self.era);
+        }
+        for d in done {
+            self.pending.remove(&d.key);
+            if d.era != self.era || self.sprites.contains_key(&d.key) {
+                continue;
+            }
+            let bytes = glib::Bytes::from_owned(d.data);
+            let tex = gdk::MemoryTexture::new(d.w, d.h, gdk::MemoryFormat::B8g8r8a8Premultiplied, &bytes, d.stride as usize);
+            self.insert_sprite(d.key, tex, d.w, d.h, d.ox, d.oy, d.len, ds);
+        }
+    }
+}
+
 const MAX_SPRITE_BYTES: usize = 160 << 20;
-/// Cuántas veces por segundo se repinta la decoración que se mece.
-const DECOR_HZ: f64 = 10.0;
 
 pub(crate) fn texture_of(mut surf: cairo::ImageSurface) -> Option<gdk::MemoryTexture> {
     let (w, h, stride) = (surf.width(), surf.height(), surf.stride() as usize);
@@ -216,9 +321,9 @@ pub fn render(widget: &gtk::Widget, snap: &gtk::Snapshot, v: &View, cache: &mut 
     }
     let ds = widget.scale_factor().max(1) as f64;
     let size = (w as i32, h as i32);
+    cache.frame = cache.frame.wrapping_add(1);
     if cache.style != Some(v.style) {
-        cache.sprites.clear();
-        cache.bytes = 0;
+        cache.clear_sprites();
         cache.real.clear();
         cache.style = Some(v.style);
     }
@@ -227,23 +332,27 @@ pub fn render(widget: &gtk::Widget, snap: &gtk::Snapshot, v: &View, cache: &mut 
             // Otro tema de Omarchy: el agua, la arena y los peces del estilo realista se recalculan.
             cache.real.clear();
         }
-        cache.sprites.clear();
-        cache.bytes = 0;
+        cache.clear_sprites();
         cache.rays = None;
         cache.scan = None;
         cache.caustic = None;
         cache.sand = None;
-        cache.decor.clear();
-        cache.decor_stamp = -1;
+        cache.pixel_water = None;
         cache.pal = v.pal.raw.clone();
         cache.ds = ds;
         cache.size = size;
+        cache.worker(v.pal, ds).set_env(v.pal, ds);
     }
-    if cache.bytes > MAX_SPRITE_BYTES {
-        cache.sprites.clear();
-        cache.bytes = 0;
+    if cache.font != v.font {
+        cache.layouts.clear();
+        cache.font = v.font.to_string();
     }
-    cache.budget = if v.style == Style::Realistic { 2 } else { 4 };
+    cache.evict();
+    cache.collect(ds);
+    // Renderizado síncrono solo de emergencia (un pez sin ningún sprite parecido): el resto lo
+    // hace el hilo de sprites.
+    cache.budget = if v.style == Style::Realistic { 1 } else { 2 };
+    cache.decor_budget = 2;
     if v.style == Style::Realistic {
         if (cache.ds - ds).abs() > 0.01 {
             cache.real.clear();
@@ -256,6 +365,7 @@ pub fn render(widget: &gtk::Widget, snap: &gtk::Snapshot, v: &View, cache: &mut 
         return;
     }
 
+    let mut laps = draw::Laps::new("tank");
     let px = v.style == Style::Pixel;
     draw::set_cell(t.scale());
     let cell = draw::cell();
@@ -263,13 +373,28 @@ pub fn render(widget: &gtk::Widget, snap: &gtk::Snapshot, v: &View, cache: &mut 
     let (top_c, bot_c) = draw::water_colors(v);
     let b = t.boil;
 
-    // Agua: degradado, o franjas planas en el estilo Pixel.
+    // Agua: degradado, o franjas planas con tramado en el estilo Pixel (una textura a una celda
+    // por píxel, horneada por tono del agua: el tramado son más de mil celdas por fotograma).
     if px {
-        for (y0, y1, c) in crate::pixel::water_bands(v) {
-            snap.append_color(&col(c, 1.0), &rect(0.0, y0, w, y1 - y0 + 0.5));
+        let wkey = (b * 20.0).round() as i32;
+        if cache.pixel_water.as_ref().map(|c| c.0) != Some(wkey) {
+            let tex = bake_px(w, h, cell, |cr| {
+                cr.set_antialias(cairo::Antialias::None);
+                for (y0, y1, c) in crate::pixel::water_bands(v) {
+                    cr.set_source_rgb(c.0, c.1, c.2);
+                    cr.rectangle(0.0, y0, w, y1 - y0 + cell);
+                    let _ = cr.fill();
+                }
+                for (x, y, c) in crate::pixel::dither_cells(v) {
+                    cr.set_source_rgb(c.0, c.1, c.2);
+                    cr.rectangle(x, y, cell, cell);
+                    let _ = cr.fill();
+                }
+            });
+            cache.pixel_water = tex.map(|t| (wkey, t));
         }
-        for (x, y, c) in crate::pixel::dither_cells(v) {
-            snap.append_color(&col(c, 1.0), &rect(x, y, cell, cell));
+        if let Some((_, tex)) = &cache.pixel_water {
+            snap.append_scaled_texture(tex, gsk::ScalingFilter::Nearest, &full);
         }
     } else {
         snap.append_linear_gradient(&full, &pt(0.0, 0.0), &pt(0.0, h), &stops(&[(0.0, top_c, 1.0), (1.0, bot_c, 1.0)]));
@@ -293,6 +418,7 @@ pub fn render(widget: &gtk::Widget, snap: &gtk::Snapshot, v: &View, cache: &mut 
         snap.restore();
     }
 
+    laps.lap("agua");
     // Nieve marina.
     let mote = col(lighten(top_c, 0.7), 1.0);
     for m in &t.motes {
@@ -369,7 +495,9 @@ pub fn render(widget: &gtk::Widget, snap: &gtk::Snapshot, v: &View, cache: &mut 
         }
     }
 
+    laps.lap("fondo");
     decor(snap, cache, v, ds);
+    laps.lap("decor");
 
     // Los compañeros de banco del pez señalado se iluminan suavemente.
     if let Some(Pick::Fish(hi)) = v.hover
@@ -391,22 +519,25 @@ pub fn render(widget: &gtk::Widget, snap: &gtk::Snapshot, v: &View, cache: &mut 
     for &i in &t.order {
         fish(snap, cache, v, i, ds);
     }
+    laps.lap("peces");
     if px {
         pixel_bubbles(snap, v, top_c);
     } else {
         bubbles(snap, v, top_c);
     }
+    laps.lap("burbujas");
 
-    // Superficie: una franja fina que sí se repinta cada fotograma.
+    // Superficie: una franja fina que sí se repinta cada fotograma (en Pixel, a una celda por píxel).
     let strip = t.surface_y() + 30.0 * t.scale();
-    {
-        let cr = snap.append_cairo(&rect(0.0, 0.0, w, strip));
-        if px {
-            crate::pixel::surface(&cr, v);
-        } else {
-            draw::surface(&cr, v);
+    if px {
+        if let Some(tex) = bake_px(w, strip, cell, |cr| crate::pixel::surface(cr, v)) {
+            snap.append_scaled_texture(&tex, gsk::ScalingFilter::Nearest, &rect(0.0, 0.0, w, strip));
         }
+    } else {
+        let cr = snap.append_cairo(&rect(0.0, 0.0, w, strip));
+        draw::surface(&cr, v);
     }
+    laps.lap("superficie");
 
     // Turbidez, viñeta y tinte de calor.
     let k = ((t.ram_frac - 0.5) / 0.5).clamp(0.0, 1.0);
@@ -440,7 +571,10 @@ pub fn render(widget: &gtk::Widget, snap: &gtk::Snapshot, v: &View, cache: &mut 
         snap.pop();
     }
 
-    labels(snap, widget, v);
+    laps.lap("velos");
+    labels(snap, widget, v, cache);
+    laps.lap("textos");
+    laps.done(60);
 }
 
 // ---------------------------------------------------------------- sonar
@@ -478,6 +612,18 @@ fn sonar_render(widget: &gtk::Widget, snap: &gtk::Snapshot, v: &View, cache: &mu
         snap.append_texture(tex, &rect(0.0, 0.0, 1.0, 3.0));
         snap.pop();
     }
+    // Anillos de alcance, estela del barrido (degradado cónico) y brazo.
+    let (cx, cy, ang) = sonar::sweep(t);
+    for k in 1..=4 {
+        let r = h * 1.25 * k as f64 / 4.0;
+        ring(snap, &rect(cx - r, cy - r, 2.0 * r, 2.0 * r), r as f32, 1.0, &col(lc, 0.12));
+    }
+    snap.append_conic_gradient(&full, &pt(cx, cy), ang.to_degrees() as f32, &stops(&[(0.0, lc, 0.0), (0.76, lc, 0.0), (1.0, lc, 0.42)]));
+    snap.save();
+    snap.translate(&pt(cx, cy));
+    snap.rotate(ang.to_degrees() as f32);
+    snap.append_color(&col(lc, 0.9), &rect(-0.75, -h * 1.5, 1.5, h * 1.5));
+    snap.restore();
     for m in &t.motes {
         snap.append_color(&col(lc, 0.08 + 0.25 * m.z), &rect(m.x.round(), m.y.round(), 1.0, 1.0));
     }
@@ -523,105 +669,163 @@ fn sonar_render(widget: &gtk::Widget, snap: &gtk::Snapshot, v: &View, cache: &mu
     }
     let big = w.max(h) * 0.8;
     snap.append_radial_gradient(&full, &pt(w / 2.0, h / 2.0), big as f32, big as f32, (w.min(h) * 0.4 / big) as f32, 1.0, &stops(&[(0.0, (0.0, 0.0, 0.0), 0.0), (1.0, (0.0, 0.0, 0.0), 0.45)]));
-    labels(snap, widget, v);
+    labels(snap, widget, v, cache);
 }
 
 // ---------------------------------------------------------------- decoración
 
+/// Asegura el sprite de decoración `k`; si no hay presupuesto, devuelve la fase más cercana que exista.
+fn ensure_decor(cache: &mut GpuCache, v: &View, d: &crate::sim::Decor, k: DKey, bs: f64, ds: f64) -> Option<DKey> {
+    if cache.decor.contains_key(&k) {
+        return Some(k);
+    }
+    let np = draw::decor_phases(d.kind) as i32;
+    if cache.decor_budget == 0 {
+        return cache
+            .decor
+            .keys()
+            .filter(|o| o.kind == k.kind && o.seed == k.seed && o.size == k.size && o.agit == k.agit)
+            .min_by_key(|o| {
+                let dp = (o.phase as i32 - k.phase as i32).abs();
+                dp.min(np - dp)
+            })
+            .copied();
+    }
+    cache.decor_budget -= 1;
+    let px = v.style == Style::Pixel;
+    let s = bs;
+    let (hw, top, bot) = (s * 0.72 + 8.0, s * 1.2 + 10.0, 12.0);
+    let (bw, bh) = (hw * 2.0, top + bot);
+    let agit = 1.0 + 2.5 * (k.agit as f64 / 3.0);
+    let pose = draw::DecorPose { x: 0.0, y: 0.0, size: s, phase: (k.phase as f64 + 0.5) / np as f64 * 2.0 * std::f64::consts::PI, agit, hover: false };
+    let paint = |cr: &cairo::Context| {
+        cr.translate(hw, top);
+        if v.style == Style::Sonar {
+            // Silueta apagada: la pieza se usa como máscara de un solo color.
+            cr.push_group();
+            draw::decor_at(cr, v.pal, d, &pose);
+            let _ = cr.pop_group_to_source();
+            let pat = cr.source();
+            let c = mix(v.pal.dfg, crate::sonar::line_color(v.pal, 0.0), 0.3);
+            cr.set_source_rgba(c.0, c.1, c.2, 0.55);
+            let _ = cr.mask(&pat);
+        } else {
+            draw::decor_at(cr, v.pal, d, &pose);
+        }
+    };
+    let (tex, wp, hp) = if px {
+        let cell = draw::cell();
+        let tex = bake_px(bw, bh, cell, paint)?;
+        (tex, (bw / cell).ceil() as i32, (bh / cell).ceil() as i32)
+    } else {
+        let tex = bake(bw, bh, ds, paint)?;
+        ((tex), (bw * ds).ceil() as i32, (bh * ds).ceil() as i32)
+    };
+    cache.bytes += (wp * hp * 4) as usize;
+    cache.decor.insert(k, DecorTex { tex, w: bw as f32, h: bh as f32, ox: hw as f32, oy: top as f32, size: s });
+    Some(k)
+}
+
+/// Decoración estilizada: sprites por fase de balanceo (una vez cada uno), mezclados de dos en dos
+/// en la GPU para que el movimiento sea continuo. En Pixel no se mezcla: salta de fase en fase.
 fn decor(snap: &gtk::Snapshot, cache: &mut GpuCache, v: &View, ds: f64) {
     let t = v.tank;
     let px = v.style == Style::Pixel;
-    // Se repinta a pocos Hz: la decoración se mece despacio y Cairo es lo más caro del fotograma.
-    let stamp = (t.t * DECOR_HZ).floor() as i64;
-    if stamp != cache.decor_stamp || cache.decor.len() != t.decor.len() {
-        cache.decor_stamp = stamp;
-        cache.decor = t
-            .decor
-            .iter()
-            .enumerate()
-            .filter_map(|(i, d)| {
-                let (bx, by, bw, bh) = draw::decor_box(t, d);
-                let hover = v.hover == Some(Pick::Decor(i));
-                let tex = if px {
-                    bake_px(bw, bh, draw::cell(), |cr| {
-                        cr.translate(-bx, -by);
-                        draw::decor(cr, v, d, hover);
-                    })?
+    for (i, d) in t.decor.iter().enumerate() {
+        let np = draw::decor_phases(d.kind);
+        let pose = draw::decor_pose(t, d, false);
+        let (b, bs) = crate::reef::decor::bucket(d.size);
+        let agit = (t.boil * 3.0).round().clamp(0.0, 3.0) as u8;
+        let f = pose.phase / (2.0 * std::f64::consts::PI) * np as f64;
+        let (i0, mixp) = (f.floor() as usize % np, f - f.floor());
+        let k0 = DKey { kind: d.kind as u8, seed: d.seed, size: b, phase: i0 as u8, agit };
+        let Some(k0) = ensure_decor(cache, v, d, k0, bs, ds) else { continue };
+        let k1 = (np > 1 && !px).then(|| DKey { phase: ((i0 + 1) % np) as u8, ..k0 }).and_then(|k| ensure_decor(cache, v, d, k, bs, ds));
+        let (sx, sy) = if px { (draw::snap(pose.x), draw::snap(pose.y)) } else { (pose.x, pose.y) };
+        let a = {
+            let s0 = &cache.decor[&k0];
+            (s0.w, s0.h, s0.ox, s0.oy, s0.size)
+        };
+        let sc = (d.size / a.4) as f32;
+        let r = graphene::Rect::new(-a.2, -a.3, a.0, a.1);
+        snap.save();
+        snap.translate(&pt(sx, sy));
+        snap.scale(sc, sc);
+        match k1 {
+            Some(k1) if k1 != k0 => {
+                snap.push_cross_fade(mixp);
+                snap.append_texture(&cache.decor[&k0].tex, &r);
+                snap.pop();
+                snap.append_texture(&cache.decor[&k1].tex, &r);
+                snap.pop();
+            }
+            _ => {
+                if px {
+                    snap.append_scaled_texture(&cache.decor[&k0].tex, gsk::ScalingFilter::Nearest, &r);
                 } else {
-                    bake(bw, bh, ds, |cr| {
-                        cr.translate(-bx, -by);
-                        if v.style == Style::Sonar {
-                            // Silueta apagada: la pieza se usa como máscara de un solo color.
-                            cr.push_group();
-                            draw::decor(cr, v, d, false);
-                            let _ = cr.pop_group_to_source();
-                            let pat = cr.source();
-                            let c = mix(v.pal.dfg, crate::sonar::line_color(v.pal, 0.0), 0.3);
-                            cr.set_source_rgba(c.0, c.1, c.2, 0.55);
-                            let _ = cr.mask(&pat);
-                        } else {
-                            draw::decor(cr, v, d, hover);
-                        }
-                    })?
-                };
-                Some(DecorTex { tex, rect: rect(bx, by, bw, bh) })
-            })
-            .collect();
-    }
-    for d in &cache.decor {
-        if px {
-            snap.append_scaled_texture(&d.tex, gsk::ScalingFilter::Nearest, &d.rect);
-        } else {
-            snap.append_texture(&d.tex, &d.rect);
+                    snap.append_texture(&cache.decor[&k0].tex, &r);
+                }
+            }
+        }
+        snap.restore();
+        if v.hover == Some(Pick::Decor(i)) {
+            let (bx, by, bw, bh) = draw::decor_box(t, d);
+            outline(snap, &rect(bx, by, bw, bh), &col(v.pal.accent, 0.6));
         }
     }
 }
 
 // ---------------------------------------------------------------- peces
 
-/// Sprite del pez `i` (renderizado con Cairo una sola vez por variante).
+/// Sprite del pez `i`. Si aún no existe se pide al hilo de sprites y, mientras tanto, se usa el
+/// más parecido que haya (misma familia: especie, patrón y colores; tamaño y fase más cercanos).
+/// Solo si no hay ninguno de la familia se pinta en el acto, para que el pez no sea invisible.
 fn sprite<'a>(cache: &'a mut GpuCache, v: &View, i: usize, ds: f64) -> Option<&'a GpuSprite> {
     let f = &v.tank.fish[i];
     let (key, blen) = draw::sprite_key(f, v.style);
-    if !cache.sprites.contains_key(&key) && cache.budget == 0 && key.style != 1 {
-        // Sin presupuesto este fotograma: vale el sprite más parecido que ya exista (misma especie y
-        // colores, tamaño más cercano, cualquier fase). Así nunca hay tirones por renderizar.
-        if let Some(k) = cache
-            .sprites
-            .keys()
-            .filter(|k| k.species == key.species && k.pattern == key.pattern && k.c1 == key.c1 && k.c2 == key.c2 && k.dying == key.dying && k.style == key.style)
-            .min_by_key(|k| ((k.size - key.size).abs() as i32) * 16 + (k.phase as i32 - key.phase as i32).abs())
-            .copied()
-        {
-            return cache.sprites.get(&k);
-        }
-    }
-    if !cache.sprites.contains_key(&key) {
-        let np = draw::nphases(f.len);
-        // Si ya hay un sprite de una fase vecina, vale mientras no sobre presupuesto de renderizado.
-        let near = (1..=np / 2).find_map(|d| {
-            [(key.phase as usize + d) % np, (key.phase as usize + np - d) % np]
-                .into_iter()
-                .map(|p| SKey { phase: p as u8, ..key })
-                .find(|k| cache.sprites.contains_key(k))
-        });
-        if let Some(k) = near
-            && cache.budget == 0 {
-                return cache.sprites.get(&k);
-            }
-        cache.budget = cache.budget.saturating_sub(1);
-        let spr = draw::render_sprite(f, &key, blen, v.pal, ds);
+    let frame = cache.frame;
+    let sync = |cache: &mut GpuCache| {
+        let spr = draw::render_sprite(&f.look, f.len, &key, blen, v.pal, ds);
         let (wp, hp) = (spr.surf.width(), spr.surf.height());
         let tex = texture_of(spr.surf)?;
-        cache.bytes += (wp * hp * 4) as usize;
-        // Los sprites de píxeles no llevan escala de dispositivo: se amplían por su factor entero.
-        let k = if key.style == 1 { key.size as f64 } else { 1.0 / ds };
-        cache.sprites.insert(
-            key,
-            GpuSprite { tex, w: (wp as f64 * k) as f32, h: (hp as f64 * k) as f32, ox: spr.ox as f32, oy: spr.oy as f32, len: spr.len },
-        );
-    }
-    cache.sprites.get(&key)
+        cache.insert_sprite(key, tex, wp, hp, spr.ox, spr.oy, spr.len, ds);
+        cache.pending.remove(&key);
+        Some(())
+    };
+    let chosen: Option<SKey> = if cache.sprites.contains_key(&key) {
+        Some(key)
+    } else if key.style == 1 {
+        // Píxeles: dibujados a mano, baratos; en el acto.
+        sync(cache).map(|_| key)
+    } else {
+        let stale = cache.pending.get(&key).is_some_and(|&fr| frame.wrapping_sub(fr) > 90);
+        if (stale || !cache.pending.contains_key(&key)) && cache.pending.len() < 256 {
+            let job = Job { key, look: f.look, len: f.len, blen, era: cache.era };
+            cache.worker(v.pal, ds).request(job);
+            cache.pending.insert(key, frame);
+        }
+        let np = draw::nphases(f.len) as i32;
+        let near = cache.index.get(&family(&key)).and_then(|ks| {
+            ks.iter()
+                .min_by_key(|k| {
+                    let dp = (k.phase as i32 - key.phase as i32).abs();
+                    ((k.size - key.size).abs() as i32) * 16 + dp.min(np - dp) + (k.amp as i32 - key.amp as i32).abs() * 2
+                })
+                .copied()
+        });
+        match near {
+            Some(k) => Some(k),
+            None if cache.budget > 0 => {
+                cache.budget -= 1;
+                sync(cache).map(|_| key)
+            }
+            None => None,
+        }
+    };
+    let k = chosen?;
+    let s = cache.sprites.get_mut(&k)?;
+    s.used = frame;
+    Some(&*s)
 }
 
 pub(crate) fn fish(snap: &gtk::Snapshot, cache: &mut GpuCache, v: &View, i: usize, ds: f64) {
@@ -645,7 +849,10 @@ pub(crate) fn fish(snap: &gtk::Snapshot, cache: &mut GpuCache, v: &View, i: usiz
         snap.rotate((-f.pitch).to_degrees() as f32);
         snap.scale(k, k);
     }
-    let alpha = f.alpha * draw::depth_alpha(f, v.style);
+    let mut alpha = f.alpha * draw::depth_alpha(f, v.style);
+    if v.style == Style::Sonar {
+        alpha *= 0.55 + 0.45 * crate::sonar::echo(v.tank, f.x, f.y);
+    }
     let fade = alpha < 0.99;
     if fade {
         snap.push_opacity(alpha.clamp(0.0, 1.0));
@@ -732,27 +939,36 @@ fn pixel_bubbles(snap: &gtk::Snapshot, v: &View, top_c: Rgb) {
 
 // ---------------------------------------------------------------- texto
 
-pub(crate) fn labels(snap: &gtk::Snapshot, widget: &gtk::Widget, v: &View) {
+/// Layout de Pango cacheado por texto y tamaño: maquetar texto cuesta decenas de µs y los nombres
+/// de los bancos se repiten fotograma tras fotograma.
+fn layout(cache: &mut GpuCache, widget: &gtk::Widget, s: &str, font: &str, size: f64) -> pango::Layout {
+    if cache.layouts.len() > 600 {
+        cache.layouts.clear();
+    }
+    cache.layouts.entry((s.to_string(), (size * 10.0) as u32)).or_insert_with(|| text(widget, s, font, size)).clone()
+}
+
+pub(crate) fn labels(snap: &gtk::Snapshot, widget: &gtk::Widget, v: &View, cache: &mut GpuCache) {
     let t = v.tank;
     let p = v.pal;
     let plan = draw::plan_labels(v);
     let fs = plan.fs;
     for n in &plan.names {
-        let l = text(widget, &n.text, v.font, fs);
+        let l = layout(cache, widget, &n.text, v.font, fs);
         let (tw, _) = l.pixel_size();
         snap.append_color(&col(p.dbg, 0.55), &rect(n.x - tw as f64 / 2.0 - 5.0, n.y - fs - 1.0, tw as f64 + 10.0, fs + 6.0));
         put_text(snap, &l, n.x - tw as f64 / 2.0, n.y, draw::label_color(p));
     }
     if let Some(hid) = &plan.hidden {
-        put_text(snap, &text(widget, hid, v.font, fs), 12.0, t.h - 12.0, mix(draw::label_color(p), (0.5, 0.6, 0.7), 0.35));
+        put_text(snap, &layout(cache, widget, hid, v.font, fs), 12.0, t.h - 12.0, mix(draw::label_color(p), (0.5, 0.6, 0.7), 0.35));
     }
     if plan.paused {
-        let l = text(widget, crate::i18n::tr("paused"), v.font, fs + 3.0);
+        let l = layout(cache, widget, crate::i18n::tr("paused"), v.font, fs + 3.0);
         let (tw, _) = l.pixel_size();
         put_text(snap, &l, t.w - tw as f64 - 14.0, t.surface_y() + fs + 12.0, p.yellow);
     }
     let Some(card) = &plan.card else { return };
-    let layouts: Vec<pango::Layout> = card.lines.iter().map(|s| text(widget, s, v.font, fs)).collect();
+    let layouts: Vec<pango::Layout> = card.lines.iter().map(|s| layout(cache, widget, s, v.font, fs)).collect();
     let tw = layouts.iter().map(|l| l.pixel_size().0).max().unwrap_or(0) as f64;
     let (bx, by, bw, bh, lh) = draw::card_rect(card, tw, fs, t);
     let r = rect(bx, by, bw, bh);
