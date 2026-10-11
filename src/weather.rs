@@ -14,7 +14,7 @@ use gtk::glib;
 use gtk::prelude::*;
 
 use crate::draw::{Quiet, lin, rgba};
-use crate::i18n::{tr, trf};
+use crate::i18n::tr;
 use crate::reef::noise;
 use crate::sim::Rng;
 use crate::sys::Reading;
@@ -442,7 +442,16 @@ impl Weather {
         if let Some(n) = self.nvme {
             marks.push((n, "NVME", pal.heat(n)));
         }
-        for (i, (t, name, col)) in marks.iter().enumerate() {
+        // Marcadores en el termómetro; las etiquetas se separan si dos sensores están cerca.
+        let mut ordered: Vec<(f64, &str, Rgb)> = marks.clone();
+        ordered.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal));
+        let mut label_y: Vec<f64> = ordered.iter().map(|(t, _, _)| yof(*t)).collect();
+        for i in 1..label_y.len() {
+            if label_y[i] - label_y[i - 1] < fs + 4.0 {
+                label_y[i] = label_y[i - 1] + fs + 4.0;
+            }
+        }
+        for (i, (t, name, col)) in ordered.iter().enumerate() {
             let y = yof(*t);
             rgba(cr, *col, 1.0);
             cr.move_to(tx - 6.0, y);
@@ -452,8 +461,7 @@ impl Weather {
             cr.fill_q();
             let txt = format!("{name} {t:.0}°");
             if let Ok(e) = cr.text_extents(&txt) {
-                let yy = y + fs * 0.35 + if i > 0 && (marks[0].0 - t).abs() < 6.0 { fs * i as f64 } else { 0.0 };
-                cr.move_to(tx - 18.0 - e.width(), yy);
+                cr.move_to(tx - 18.0 - e.width(), label_y[i] + fs * 0.35);
                 let _ = cr.show_text(&txt);
             }
         }
@@ -462,7 +470,7 @@ impl Weather {
         cr.rectangle(tx - 2.0, yof(self.temp), 4.0, ty1 - yof(self.temp));
         cr.fill_q();
 
-        // Cifras: estado del tiempo, viento, nubes.
+        // Leyenda: qué significa cada cosa de la escena, con el valor real al lado.
         let state = if self.temp >= CRIT {
             tr("wx_crit")
         } else if self.temp >= HOT {
@@ -472,31 +480,46 @@ impl Weather {
         } else {
             tr("wx_cool")
         };
-        cr.set_font_size(fs + 3.0);
-        let lines = [
-            format!("{} · {:.0}°", state, self.temp),
-            self.fan.map_or(trf("wx_wind", &["--".into()]), |f| trf("wx_wind", &[f.to_string()])),
-            trf("wx_clouds", &[format!("{:.2}", self.load)]),
+        let wind_txt = match (self.fan, self.fan_max) {
+            (Some(f), Some(m)) if m > 0 => format!("{f} rpm · {:.0}%", f as f64 / m as f64 * 100.0),
+            (Some(f), _) => format!("{f} rpm"),
+            _ => "--".into(),
+        };
+        let lines: Vec<(String, Rgb)> = vec![
+            (format!("{} · {:.0}°", state, self.temp), pal.heat(self.temp)),
+            (format!("{}  →  CPU {:.0}°", tr("wx_leg_sun"), self.temp), lighten(pal.bfg, 0.1)),
+            (format!("{}  →  {} {}", tr("wx_leg_wind"), tr("sens_fan"), wind_txt), lighten(pal.bfg, 0.1)),
+            (format!("{}  →  {} {:.2} ({:.0}%)", tr("wx_leg_clouds"), tr("sens_load"), self.load, self.cover_goal * 100.0), lighten(pal.bfg, 0.1)),
+            (format!("GPU {}  ·  NVME {}", self.gpu.map_or("--".into(), |v| format!("{v:.0}°")), self.nvme.map_or("--".into(), |v| format!("{v:.0}°"))), pal.fg),
         ];
-        for (i, l) in lines.iter().enumerate() {
-            if i == 1 {
-                cr.set_font_size(fs);
-            }
-            if let Ok(e) = cr.text_extents(l) {
-                rgba(cr, pal.dbg, 0.6);
-                cr.rectangle(10.0, 10.0 + (fs + 10.0) * i as f64, e.width() + 12.0, fs + 10.0);
-                cr.fill_q();
-            }
-            rgba(cr, if i == 0 { pal.heat(self.temp) } else { lighten(pal.bfg, 0.1) }, 1.0);
-            cr.move_to(16.0, 10.0 + (fs + 10.0) * (i as f64 + 1.0) - 6.0);
+        let lw = lines.iter().map(|(l, _)| cr.text_extents(l).map(|e| e.width()).unwrap_or(0.0)).fold(0.0f64, f64::max) + 20.0;
+        rgba(cr, pal.dbg, 0.62);
+        cr.rectangle(10.0, 10.0, lw.max(200.0), (fs + 9.0) * lines.len() as f64 + 14.0);
+        cr.fill_q();
+        for (i, (l, col)) in lines.iter().enumerate() {
+            cr.set_font_size(if i == 0 { fs + 3.0 } else { fs });
+            rgba(cr, *col, 1.0);
+            cr.move_to(18.0, 10.0 + 8.0 + (fs + 9.0) * (i as f64 + 1.0) - 4.0);
             let _ = cr.show_text(l);
         }
-        // Historial de temperatura abajo a la izquierda.
+        cr.set_font_size(fs);
+        // Historial de temperatura (3 min) abajo a la izquierda, con su título y las bandas.
         if self.hist.len() > 2 {
-            let (gx, gy, gw, gh) = (12.0, h - 12.0 - 60.0 * sc, w * 0.32, 60.0 * sc);
-            rgba(cr, pal.dbg, 0.55);
+            let (gx, gy, gw, gh) = (12.0, h - 12.0 - 70.0 * sc, w * 0.32, 70.0 * sc);
+            rgba(cr, pal.dbg, 0.62);
             cr.rectangle(gx, gy, gw, gh);
             cr.fill_q();
+            for (a, b, c) in [(WARM, HOT, pal.yellow), (HOT, CRIT, pal.orange), (CRIT, T_MAX, pal.red)] {
+                let (ya, yb) = (gy + gh - gh * ((a - T_MIN) / (T_MAX - T_MIN)), gy + gh - gh * ((b - T_MIN) / (T_MAX - T_MIN)));
+                rgba(cr, c, 0.12);
+                cr.rectangle(gx, yb, gw, ya - yb);
+                cr.fill_q();
+            }
+            cr.set_font_size(fs * 0.8);
+            rgba(cr, pal.dfg, 1.0);
+            cr.move_to(gx + 6.0, gy + fs * 0.8 + 3.0);
+            let _ = cr.show_text(&format!("{} · 3 min", tr("sens_cpu")));
+            cr.set_font_size(fs);
             let n = 180.0;
             for (i, &t) in self.hist.iter().enumerate() {
                 let x = gx + gw * (i as f64 + (n - self.hist.len() as f64)) / (n - 1.0);

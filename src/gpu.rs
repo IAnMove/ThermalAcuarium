@@ -243,7 +243,7 @@ pub fn render(widget: &gtk::Widget, snap: &gtk::Snapshot, v: &View, cache: &mut 
         cache.sprites.clear();
         cache.bytes = 0;
     }
-    cache.budget = if v.style == Style::Realistic { 3 } else { 6 };
+    cache.budget = if v.style == Style::Realistic { 2 } else { 4 };
     if v.style == Style::Realistic {
         if (cache.ds - ds).abs() > 0.01 {
             cache.real.clear();
@@ -583,6 +583,19 @@ fn decor(snap: &gtk::Snapshot, cache: &mut GpuCache, v: &View, ds: f64) {
 fn sprite<'a>(cache: &'a mut GpuCache, v: &View, i: usize, ds: f64) -> Option<&'a GpuSprite> {
     let f = &v.tank.fish[i];
     let (key, blen) = draw::sprite_key(f, v.style);
+    if !cache.sprites.contains_key(&key) && cache.budget == 0 && key.style != 1 {
+        // Sin presupuesto este fotograma: vale el sprite más parecido que ya exista (misma especie y
+        // colores, tamaño más cercano, cualquier fase). Así nunca hay tirones por renderizar.
+        if let Some(k) = cache
+            .sprites
+            .keys()
+            .filter(|k| k.species == key.species && k.pattern == key.pattern && k.c1 == key.c1 && k.c2 == key.c2 && k.dying == key.dying && k.style == key.style)
+            .min_by_key(|k| ((k.size - key.size).abs() as i32) * 16 + (k.phase as i32 - key.phase as i32).abs())
+            .copied()
+        {
+            return cache.sprites.get(&k);
+        }
+    }
     if !cache.sprites.contains_key(&key) {
         let np = draw::nphases(f.len);
         // Si ya hay un sprite de una fase vecina, vale mientras no sobre presupuesto de renderizado.

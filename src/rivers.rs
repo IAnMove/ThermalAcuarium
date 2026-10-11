@@ -499,8 +499,10 @@ impl Rivers {
             let ww = bed * r.level; // ancho del agua al borde del acantilado = parte usada
             let hw = |k: usize| self.half_at(i, k as f64 / (n - 1) as f64);
             let left = |k: usize| pts[k].0 - hw(k);
-            let wright = |k: usize| pts[k].0 - hw(k) + 2.0 * hw(k) * r.level;
             let right = |k: usize| pts[k].0 + hw(k);
+            // El agua va centrada en el cauce: orillas secas a ambos lados, como un río de poco caudal.
+            let wleft = |k: usize| pts[k].0 - hw(k) * r.level;
+            let wright = |k: usize| pts[k].0 + hw(k) * r.level;
             let poly = |cr: &Context, a: &dyn Fn(usize) -> f64, b: &dyn Fn(usize) -> f64| {
                 cr.move_to(a(0), pts[0].1);
                 for k in 1..n {
@@ -514,10 +516,10 @@ impl Rivers {
             let shift = -(bed - ww) / 2.0;
             // Agua: desde la orilla izquierda, tan ancha como el porcentaje usado.
             if r.level > 0.01 {
-                poly(cr, &left, &wright);
+                poly(cr, &wleft, &wright);
                 rgba(cr, darken(water, 0.5), 1.0);
                 cr.fill_q();
-                poly(cr, &|k| left(k) + 1.5, &|k| wright(k) - 1.5);
+                poly(cr, &|k| wleft(k) + 1.5, &|k| wright(k) - 1.5);
                 let _ = cr.set_source(lin(0.0, self.sky_y(), 0.0, cy, &[(0.0, lighten(water, 0.35), 1.0), (1.0, water, 1.0)]));
                 cr.fill_keep();
                 cr.save_q();
@@ -527,9 +529,9 @@ impl Rivers {
                 // Estelas de corriente: su velocidad es la actividad del disco.
                 for s_ in 0..4 {
                     let f = 0.15 + 0.7 * s_ as f64 / 3.0;
-                    cr.move_to(left(0) + (wright(0) - left(0)) * f, pts[0].1);
+                    cr.move_to(wleft(0) + (wright(0) - wleft(0)) * f, pts[0].1);
                     for k in 1..n {
-                        cr.line_to(left(k) + (wright(k) - left(k)) * f, pts[k].1);
+                        cr.line_to(wleft(k) + (wright(k) - wleft(k)) * f, pts[k].1);
                     }
                     rgba(cr, foam, 0.2 + 0.35 * r.flow);
                     cr.set_line_width((1.0 + 0.4 * s_ as f64) * sc.max(0.8));
@@ -538,14 +540,16 @@ impl Rivers {
                 }
                 cr.set_dash(&[], 0.0);
                 cr.restore_q();
-                // Brillo de la orilla del agua.
-                cr.move_to(wright(0), pts[0].1);
-                for k in 1..n {
-                    cr.line_to(wright(k), pts[k].1);
+                // Brillo de las dos orillas del agua.
+                for edge in [&wleft as &dyn Fn(usize) -> f64, &wright] {
+                    cr.move_to(edge(0), pts[0].1);
+                    for k in 1..n {
+                        cr.line_to(edge(k), pts[k].1);
+                    }
+                    rgba(cr, foam, 0.5);
+                    cr.set_line_width(1.2);
+                    cr.stroke_q();
                 }
-                rgba(cr, foam, 0.5);
-                cr.set_line_width(1.2);
-                cr.stroke_q();
             }
             // Regla a lo ancho del cauce, al borde del acantilado: 0 % en la orilla izquierda, 100 % en la derecha.
             let ey = pts[n - 1].1;
@@ -574,17 +578,23 @@ impl Rivers {
                 }
             }
             cr.set_font_size(fs);
+            // Marcadores en las dos orillas del agua: la franja entre ellos es la parte usada.
             rgba(cr, foam, 1.0);
-            cr.move_to(gx0 + gw * r.level, gy - 5.0);
-            cr.line_to(gx0 + gw * r.level - 4.0, gy - 11.0);
-            cr.line_to(gx0 + gw * r.level + 4.0, gy - 11.0);
-            cr.close_path();
+            for xm in [gx0 + gw * (0.5 - r.level / 2.0), gx0 + gw * (0.5 + r.level / 2.0)] {
+                cr.move_to(xm, gy - 5.0);
+                cr.line_to(xm - 4.0, gy - 11.0);
+                cr.line_to(xm + 4.0, gy - 11.0);
+                cr.close_path();
+                cr.fill_q();
+            }
+            rgba(cr, foam, 0.9);
+            cr.rectangle(gx0 + gw * (0.5 - r.level / 2.0), gy - 2.0, gw * r.level, 4.0);
             cr.fill_q();
             // Etiquetas: usado sobre el agua, libre sobre la grava.
             let mk = n * 3 / 4;
             let mid = pts[mk];
             for (k, (txt, x, col)) in [
-                (format!("{} {}", crate::i18n::tr("disk_used"), fmt_bytes(r.mounts.iter().map(|m| m.1).sum())), (left(mk) + wright(mk)) / 2.0, lighten(pal.bfg, 0.1)),
+                (format!("{} {}", crate::i18n::tr("disk_used"), fmt_bytes(r.mounts.iter().map(|m| m.1).sum())), pts[mk].0, lighten(pal.bfg, 0.1)),
                 (format!("{} {}", crate::i18n::tr("disk_free"), fmt_bytes(r.mounts.iter().map(|m| m.2 - m.1).sum::<f64>().max(0.0))), (wright(mk) + right(mk)) / 2.0, pal.fg),
             ]
             .into_iter()
@@ -602,38 +612,80 @@ impl Rivers {
                 }
             }
 
-            // Afluentes.
+            // Afluentes: arroyos que nacen en la ladera y serpentean hasta la orilla del agua. Los de
+            // la izquierda llegan a la orilla izquierda, los de la derecha a la derecha.
             let my_tribs: Vec<&Tributary> = self.tribs.iter().enumerate().filter(|(k, _)| k % self.lanes() == i).map(|(_, t)| t).collect();
             for (k, t) in my_tribs.iter().enumerate() {
-                let u = 0.25 + 0.6 * (k as f64 + 0.5) / my_tribs.len().max(1) as f64;
-                let j = ((pts.len() - 1) as f64 * u) as usize;
-                let (jx, jy) = (left(j) + 2.0, pts[j].1);
-                let side = -1.0;
-                let sx = x0 + 14.0;
-                let tw = (1.5 + 10.0 * flow01(t.bps)) * sc;
-                let col = if t.write { mix(water, foam, 0.3) } else { water };
-                for (extra, c, a) in [(4.0, (0.18, 0.15, 0.10), 0.5), (1.5, darken(col, 0.4), 1.0), (0.0, col, 1.0)] {
-                    cr.move_to(sx, jy - 46.0 * sc);
-                    cr.curve_to(sx + (jx - sx) * 0.3, jy - 32.0 * sc, jx - (jx - sx) * 0.2, jy - 8.0, jx, jy);
-                    rgba(cr, c, a);
-                    cr.set_line_width(tw + extra);
-                    cr.stroke_q();
-                }
+                let side = if k % 2 == 0 { -1.0 } else { 1.0 };
+                let u = 0.22 + 0.62 * (k as f64 + 0.5) / my_tribs.len().max(1) as f64;
+                let j = ((n - 1) as f64 * u) as usize;
+                let (jx, jy) = (if side < 0.0 { wleft(j) } else { wright(j) }, pts[j].1);
+                // Manantial: en el borde del carril, más arriba que la confluencia.
+                let sx = if side < 0.0 { x0 + 18.0 + 30.0 * noise::rnd(k as i32, 4, 40 + i as u32) } else { x1 - dw - 18.0 - 30.0 * noise::rnd(k as i32, 4, 40 + i as u32) };
+                let sy = (jy - (70.0 + 90.0 * noise::rnd(k as i32, 5, 40 + i as u32)) * sc).max(self.sky_y() + 30.0);
+                let m = 18;
+                let spts: Vec<(f64, f64)> = (0..=m)
+                    .map(|q| {
+                        let v = q as f64 / m as f64;
+                        // Curva suave con un meandro, que se endereza al llegar al río.
+                        let x = sx + (jx - sx) * (v * v * (3.0 - 2.0 * v)) + (noise::fbm1(v * 3.0 + k as f64 * 5.0, 2, 90 + i as u32) - 0.5) * 36.0 * sc * (1.0 - v) * v.sqrt();
+                        let y = sy + (jy - sy) * v + (noise::fbm1(v * 2.0 + k as f64 * 7.0, 2, 95 + i as u32) - 0.5) * 20.0 * sc * (1.0 - v);
+                        (x, y)
+                    })
+                    .collect();
+                let path = |cr: &Context, inset: f64| {
+                    cr.move_to(spts[0].0, spts[0].1);
+                    for p in &spts[1..] {
+                        cr.line_to(p.0 + inset, p.1);
+                    }
+                };
+                let act = flow01(t.bps);
+                let tw = (2.0 + 9.0 * act) * sc;
+                let col = if t.write { mix(water, foam, 0.25) } else { water };
+                // Lecho del arroyo (grava y orilla húmeda), agua y brillo.
+                path(cr, 0.0);
+                rgba(cr, (0.20, 0.16, 0.11), 0.6);
+                cr.set_line_width(tw + 7.0 * sc);
+                cr.stroke_q();
+                path(cr, 0.0);
+                rgba(cr, mix((0.66, 0.60, 0.48), mix(pal.dfg, pal.bg, 0.4), 0.3), 1.0);
+                cr.set_line_width(tw + 4.0 * sc);
+                cr.stroke_q();
+                path(cr, 0.0);
+                rgba(cr, darken(col, 0.45), 1.0);
+                cr.set_line_width(tw + 1.5);
+                cr.stroke_q();
+                path(cr, 0.0);
+                rgba(cr, col, 1.0);
+                cr.set_line_width(tw);
+                cr.stroke_q();
+                path(cr, 0.0);
+                rgba(cr, foam, 0.25 + 0.35 * act);
+                cr.set_line_width((tw * 0.35).max(0.8));
+                cr.set_dash(&[6.0, 14.0], -self.t * (30.0 + 160.0 * act));
+                cr.stroke_q();
+                cr.set_dash(&[], 0.0);
+                // Espuma en la confluencia.
+                rgba(cr, foam, 0.35 + 0.3 * act);
+                cr.arc(jx, jy, tw * 0.9 + 2.0, 0.0, 2.0 * PI);
+                cr.fill_q();
+                // Etiqueta junto al manantial.
                 let txt = format!("{} {} {}/s", if t.write { "↑" } else { "↓" }, t.name, fmt_bytes(t.bps));
                 if let Ok(e) = cr.text_extents(&txt) {
-                    let x = if side < 0.0 { sx } else { (sx - e.width()).max(x0 + 4.0) };
-                    rgba(cr, pal.dbg, 0.6);
-                    cr.rectangle(x - 4.0, jy - 50.0 * sc - fs - 1.0, e.width() + 8.0, fs + 6.0);
+                    let x = if side < 0.0 { (sx - 6.0).max(x0 + 4.0) } else { (sx + 6.0 - e.width()).min(x1 - dw - e.width() - 4.0) };
+                    let y = sy - 8.0;
+                    rgba(cr, pal.dbg, 0.65);
+                    cr.rectangle(x - 4.0, y - fs - 1.0, e.width() + 8.0, fs + 6.0);
                     cr.fill_q();
                     rgba(cr, lighten(pal.bfg, 0.1), 1.0);
-                    cr.move_to(x, jy - 50.0 * sc);
+                    cr.move_to(x, y);
                     let _ = cr.show_text(&txt);
                 }
             }
 
             // Embalse.
             let lvl = bt + (bb - bt) * (1.0 - r.level);
-            let fx = (left(n - 1) + wright(n - 1)) / 2.0;
+            let fx = pts[n - 1].0;
             let _ = shift;
             let xr = x1 - dw;
             let _ = cr.set_source(lin(0.0, lvl, 0.0, bb, &[(0.0, lighten(water, 0.15), 1.0), (0.4, water, 1.0), (1.0, darken(water, 0.6), 1.0)]));

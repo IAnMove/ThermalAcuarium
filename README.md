@@ -26,7 +26,8 @@ volcano drawn in cross‑section, like a textbook diagram. The left half is the 
 is cut open and shows the magma chamber, and **the magma level is exactly the RAM in use**, read
 against a 0–100 % scale next to it. Cache & buffers are the crust of cooler magma on top, the free
 memory is the snow cap on the outside (it melts as memory fills), the programs using the most RAM are
-the lava flows running down the slope, and swap opens glowing fissures in the plain (legend at the bottom right). Past ~90 % the crater erupts
+the lava flows running down the slope, and swap opens glowing fissures in the plain: one per program with memory in swap, labelled with its
+name and size. Past ~90 % the crater erupts
 (bombs, ash, ground shake) and the lava overflows the rim. `THERMALACUARIUM_DEMO_MEM=0.97` previews it.
 
 | 55 % | 97 % |
@@ -36,11 +37,11 @@ the lava flows running down the slope, and swap opens glowing fissures in the pl
 ## Disks tab: rivers
 
 **Disks** turns every physical disk into a river running down a valley. **The riverbed is the whole
-disk**: the water fills it from the left bank in proportion to the space used, and the dry gravel left
-on the right is the free space, with a 0–100 % rule across the bed at the cliff edge. Disk activity
+disk**: the water runs down the middle as wide as the space used, and the dry gravel banks on both sides
+are the free space (a low river in a wide bed), with a 0–100 % rule across the bed at the cliff edge. Disk activity
 (read + write, log scale) is the speed of the current; the water then plunges over the cliff into a
 reservoir whose level repeats the occupancy on the dam's gauge. The programs doing the most disk I/O
-are the tributaries joining the river (↓ read, ↑ write). Partitions and device‑mapper volumes (LUKS,
+are the tributary streams that spring from the hillside and join the river (↓ read, ↑ write). Partitions and device‑mapper volumes (LUKS,
 btrfs subvolumes) are folded into their physical disk.
 
 ![Rivers](docs/rivers.png)
@@ -51,7 +52,8 @@ btrfs subvolumes) are folded into their physical disk.
 and a soft sun; warm, haze; hot, a heat wave with the air shimmering and the grass scorched; critical,
 a firestorm with lightning and falling embers. The fans are the wind (clouds race, trees and grass
 bend), the load average is the cloud cover, and a thermometer on the right shows CPU, GPU and NVMe on
-a 30–105 °C scale with the warm/hot/critical bands. `--temp 99` previews the storm.
+a 30–105 °C scale with the warm/hot/critical bands; the legend at the top left says which part of the
+scene is which sensor, with the live value. `--temp 99` previews the storm.
 
 | 55 °C | 99 °C |
 | :--- | :--- |

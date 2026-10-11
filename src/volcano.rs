@@ -73,6 +73,8 @@ pub struct Volcano {
     pub swap_used: f64,
     pub swap_total: f64,
     pub flows: Vec<Flow>,
+    /// Programas con más memoria en swap: una fisura cada uno.
+    pub swappers: Vec<(String, f64)>,
     bombs: Vec<Bomb>,
     puffs: Vec<Puff>,
     embers: Vec<Ember>,
@@ -142,6 +144,7 @@ impl Volcano {
             swap_used: 0.0,
             swap_total: 0.0,
             flows: vec![],
+            swappers: vec![],
             bombs: vec![],
             puffs: vec![],
             embers: vec![],
@@ -182,6 +185,10 @@ impl Volcano {
         v.sort_by(|a, b| b.mem.partial_cmp(&a.mem).unwrap_or(std::cmp::Ordering::Equal));
         v.truncate(5);
         self.flows = v;
+        let mut sw: Vec<(String, f64)> = groups.iter().map(|g| (g.key.clone(), g.procs.iter().map(|p| p.swap).sum::<f64>())).filter(|x| x.1 > 1e6).collect();
+        sw.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+        sw.truncate(6);
+        self.swappers = sw;
     }
 
     // --- geometría
@@ -732,7 +739,8 @@ impl Volcano {
             cr.stroke_q();
             let txt = format!("{} · {}", f.name, fmt_bytes(f.mem));
             if let Ok(e) = cr.text_extents(&txt) {
-                let (lx, ly2) = (pts[n].0 - 8.0, pts[n].1 - 6.0 - (i % 3) as f64 * (fs + 6.0));
+                // Las etiquetas se apilan ladera arriba, una fila por colada.
+                let (lx, ly2) = (pts[n].0 - 8.0, pts[n].1 - 6.0 - i as f64 * (fs + 6.0));
                 let x = (lx - e.width()).max(4.0);
                 rgba(cr, pal.dbg, 0.65);
                 cr.rectangle(x - 4.0, ly2 - fs - 1.0, e.width() + 8.0, fs + 6.0);
@@ -824,15 +832,19 @@ impl Volcano {
         lap("smoke");
         // Swap: la llanura se agrieta y por las fisuras asoma el magma. Cuantas más y más largas,
         // más swap en uso.
-        let ncr = (self.swap * 9.0).ceil() as usize;
+        // Una fisura por programa (las más largas, los que más swap tienen), con su etiqueta.
+        let ncr = self.swappers.len();
         if self.swap_total > 0.0 && ncr > 0 {
             cr.set_line_cap(cairo::LineCap::Round);
             cr.set_line_join(cairo::LineJoin::Round);
+            let top = self.swappers[0].1.max(1.0);
             for i in 0..ncr {
+                let (name, bytes) = &self.swappers[i];
                 let sd = i as u32 * 31 + 7;
-                let x0 = w * (0.08 + 0.84 * noise::rnd(i as i32, 1, sd));
-                let y0 = hz + 10.0 + noise::rnd(i as i32, 2, sd) * (h - hz - 24.0);
-                let len = w * (0.06 + 0.16 * noise::rnd(i as i32, 3, sd)) * (0.5 + 0.5 * self.swap);
+                // Repartidas en dos filas para que las etiquetas no se pisen.
+                let x0 = w * (0.06 + 0.9 * ((i as f64 + 0.5) / ncr as f64)) - w * 0.06;
+                let y0 = hz + 16.0 + (i % 2) as f64 * (h - hz - 36.0) * 0.5 + noise::rnd(i as i32, 2, sd) * 10.0;
+                let len = w * (0.05 + 0.16 * (bytes / top).sqrt());
                 let pts: Vec<(f64, f64)> = (0..=8).map(|k| (x0 + len * k as f64 / 8.0, y0 + (noise::rnd(k, i as i32, sd) - 0.5) * 12.0)).collect();
                 let path = |cr: &Context| {
                     cr.move_to(pts[0].0, pts[0].1);
@@ -860,6 +872,19 @@ impl Volcano {
                     cr.line_to(bx + (noise::rnd(k as i32, 9, sd) - 0.5) * 24.0, by + (noise::rnd(k as i32, 10, sd) - 0.5) * 16.0);
                 }
                 cr.stroke_q();
+                // Etiqueta: programa y cuánto tiene en swap.
+                let txt = format!("{} · {} swap", name, fmt_bytes(*bytes));
+                cr.set_font_size(fs);
+                if let Ok(e) = cr.text_extents(&txt) {
+                    let x = (x0 + len / 2.0 - e.width() / 2.0).clamp(6.0, w - e.width() - 6.0);
+                    let y = y0 + 12.0 + fs;
+                    rgba(cr, pal.dbg, 0.65);
+                    cr.rectangle(x - 4.0, y - fs - 1.0, e.width() + 8.0, fs + 6.0);
+                    cr.fill_q();
+                    rgba(cr, lighten(pal.bfg, 0.1), 1.0);
+                    cr.move_to(x, y);
+                    let _ = cr.show_text(&txt);
+                }
             }
         }
 

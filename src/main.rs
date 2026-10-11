@@ -72,7 +72,6 @@ struct Model {
     sensors: Sensors,
     sys: SysSampler,
     disks: DiskSampler,
-    procs: ProcSampler,
     hover: Option<Pick>,
     cursor: Option<(f64, f64)>,
     names: u8,
@@ -160,9 +159,9 @@ fn update_sensors(ui: &Rc<Ui>) {
     ui.chips.fish.set_markup(&chip(pal, "🐟", &trf("fish_n", &[n.to_string()]).replace("🐟", ""), None));
 }
 
-fn sample_procs(ui: &Rc<Ui>) {
+/// Aplica una muestra de procesos (viene del hilo de muestreo).
+fn apply_procs(ui: &Rc<Ui>, groups: Vec<Group>) {
     let mut m = ui.m.borrow_mut();
-    let groups = m.procs.sample();
     let first = m.first_sync;
     m.first_sync = false;
     m.tank.sync(&groups, first);
@@ -390,17 +389,12 @@ fn kill_pids(ui: &Rc<Ui>, pids: Vec<i32>, key: String) {
     ui.m.borrow_mut().tank.mark_dying(&pids);
     ui.toasts.add_toast(adw::Toast::new(&trf("closing", &[key])));
 
-    let u = ui.clone();
-    glib::timeout_add_local_once(Duration::from_millis(800), move || sample_procs(&u));
-    let u = ui.clone();
     glib::timeout_add_local_once(Duration::from_secs(3), move || {
         for (p, c) in &targets {
             if comm_of(*p).as_ref() == Some(c) {
                 unsafe { libc::kill(*p, libc::SIGKILL) };
             }
         }
-        let u2 = u.clone();
-        glib::timeout_add_local_once(Duration::from_millis(600), move || sample_procs(&u2));
     });
 }
 
@@ -425,7 +419,6 @@ fn build_ui(app: &adw::Application) {
         sensors: Sensors::new(),
         sys: SysSampler::default(),
         disks: DiskSampler::default(),
-        procs: ProcSampler::new(),
         hover: None,
         cursor: None,
         names: 0,
@@ -632,21 +625,37 @@ fn build_ui(app: &adw::Application) {
 
     apply_theme(&ui, true);
     update_sensors(&ui);
-    // La primera muestra solo sirve de referencia para medir CPU; la buena llega enseguida.
-    ui.m.borrow_mut().procs.sample();
+    // El muestreo de /proc va en su propio hilo (lee cientos de archivos): la interfaz no se
+    // bloquea nunca. La primera muestra solo sirve de referencia para medir la CPU.
+    let (tx, rx) = std::sync::mpsc::channel::<Vec<Group>>();
+    std::thread::Builder::new()
+        .name("procs".into())
+        .spawn(move || {
+            let mut sampler = ProcSampler::new();
+            sampler.sample();
+            std::thread::sleep(Duration::from_millis(700));
+            loop {
+                if tx.send(sampler.sample()).is_err() {
+                    return;
+                }
+                std::thread::sleep(Duration::from_secs(2));
+            }
+        })
+        .expect("hilo de procesos");
     let u = ui.clone();
-    glib::timeout_add_local_once(Duration::from_millis(700), move || {
-        sample_procs(&u);
-        update_sensors(&u);
+    glib::timeout_add_local(Duration::from_millis(150), move || {
+        let mut last = None;
+        while let Ok(g) = rx.try_recv() {
+            last = Some(g);
+        }
+        if let Some(g) = last {
+            apply_procs(&u, g);
+        }
+        glib::ControlFlow::Continue
     });
     let u = ui.clone();
     glib::timeout_add_seconds_local(1, move || {
         update_sensors(&u);
-        glib::ControlFlow::Continue
-    });
-    let u = ui.clone();
-    glib::timeout_add_seconds_local(2, move || {
-        sample_procs(&u);
         glib::ControlFlow::Continue
     });
     // Respaldo por si el sistema de archivos no avisa (p. ej. temas editados desde fuera).
@@ -738,9 +747,10 @@ fn snapshot(path: &str) {
         }
         let avg = |r: &[f64]| r.iter().sum::<f64>() / r.len() as f64;
         eprintln!(
-            "bench: primeros 30 fotogramas {:.1} ms · últimos 90 {:.1} ms · máx {:.1} ms",
+            "bench: primeros 30 fotogramas {:.1} ms · últimos 90 {:.1} ms (máx {:.1}) · máx total {:.1} ms",
             avg(&times[..30]),
             avg(&times[90..]),
+            times[90..].iter().cloned().fold(0.0, f64::max),
             times.iter().cloned().fold(0.0, f64::max)
         );
     }

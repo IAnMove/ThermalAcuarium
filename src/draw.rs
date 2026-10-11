@@ -1076,6 +1076,18 @@ fn blit_fish(cr: &Context, f: &Fish, pal: &Palette, ds: f64, style: Style) {
             crate::pixel::draw_sprite(cr, f, spr, k, f.alpha.clamp(0.0, 1.0));
             return;
         }
+        if !c.map.contains_key(&key) && !budget_left() {
+            if let Some(k) = c
+                .map
+                .keys()
+                .filter(|k| k.species == key.species && k.pattern == key.pattern && k.c1 == key.c1 && k.c2 == key.c2 && k.dying == key.dying && k.style == key.style)
+                .min_by_key(|k| ((k.size - key.size).abs() as i32) * 16 + (k.phase as i32 - key.phase as i32).abs())
+                .copied()
+            {
+                draw_sprite(cr, f, &c.map[&k], style);
+                return;
+            }
+        }
         if !c.map.contains_key(&key) {
             let np = nphases(f.len);
             // Con el sprite de una fase vecina basta; solo se renderiza si no hay ninguna.

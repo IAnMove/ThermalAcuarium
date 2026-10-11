@@ -181,6 +181,8 @@ pub struct Proc {
     pub mem: f64,
     pub wbps: f64,
     pub rbps: f64,
+    /// Memoria del proceso en swap (VmSwap).
+    pub swap: f64,
 }
 
 /// Procesos con el mismo nombre: un banco.
@@ -268,7 +270,12 @@ impl ProcSampler {
                     prev.map_or((0, 0), |p| (p.2, p.3))
                 };
                 cur.insert(pid, (start, ticks, wb, rb));
-                let mut p = Proc { pid, start, cpu: 0.0, mem: rss.max(0.0) * self.page, wbps: 0.0, rbps: 0.0 };
+                let swap = fs::read_to_string(format!("/proc/{pid}/status"))
+                    .ok()
+                    .and_then(|s| s.lines().find_map(|l| l.strip_prefix("VmSwap:").and_then(|v| v.trim().trim_end_matches("kB").trim().parse::<f64>().ok())))
+                    .unwrap_or(0.0)
+                    * 1024.0;
+                let mut p = Proc { pid, start, cpu: 0.0, mem: rss.max(0.0) * self.page, wbps: 0.0, rbps: 0.0, swap };
                 if let (Some(dt), Some((_, pt, pw, pr))) = (dt, prev)
                     && dt > 0.0
                 {
@@ -430,5 +437,23 @@ mod tests {
         let d = s.sample();
         eprintln!("{d:#?}");
         assert!(d.iter().any(|d| d.total() > 1e9), "ningún disco con capacidad: {d:?}");
+    }
+}
+
+#[cfg(test)]
+mod perf_tests {
+    use super::*;
+
+    #[test]
+    fn proc_sample_cost() {
+        let mut p = ProcSampler::new();
+        p.sample();
+        std::thread::sleep(std::time::Duration::from_millis(300));
+        let t = Instant::now();
+        let g = p.sample();
+        eprintln!("ProcSampler::sample: {:.1} ms for {} groups", t.elapsed().as_secs_f64() * 1000.0, g.len());
+        let t = Instant::now();
+        let d = DiskSampler::default().sample();
+        eprintln!("DiskSampler::sample: {:.1} ms ({} disks)", t.elapsed().as_secs_f64() * 1000.0, d.len());
     }
 }
