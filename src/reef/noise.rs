@@ -46,6 +46,28 @@ pub fn fbm(x: f64, y: f64, octaves: u32, seed: u32, period: i32) -> f64 {
     sum / norm
 }
 
+/// Ruido fractal con periodos distintos en x y en y (texturas alargadas que siguen repitiéndose:
+/// rizos de agua a lo largo de la corriente, chorros de una cascada).
+pub fn fbm_aniso(x: f64, y: f64, octaves: u32, seed: u32, px: i32, py: i32) -> f64 {
+    let (mut sum, mut amp, mut norm, mut f) = (0.0, 1.0, 0.0, 1.0);
+    for o in 0..octaves {
+        let (ppx, ppy) = (px * f as i32, py * f as i32);
+        let (xx, yy) = (x * f, y * f);
+        let (x0, y0) = (xx.floor(), yy.floor());
+        let (fx, fy) = (smooth(xx - x0), smooth(yy - y0));
+        let (ix, iy) = (x0 as i32, y0 as i32);
+        let sd = seed.wrapping_add(o * 977);
+        let c = |dx: i32, dy: i32| rnd((ix + dx).rem_euclid(ppx.max(1)), (iy + dy).rem_euclid(ppy.max(1)), sd);
+        let top = c(0, 0) + (c(1, 0) - c(0, 0)) * fx;
+        let bot = c(0, 1) + (c(1, 1) - c(0, 1)) * fx;
+        sum += amp * (top + (bot - top) * fy);
+        norm += amp;
+        amp *= 0.5;
+        f *= 2.0;
+    }
+    sum / norm
+}
+
 /// Ruido 1D (para perfiles: dunas, siluetas de roca).
 pub fn fbm1(x: f64, octaves: u32, seed: u32) -> f64 {
     fbm(x, 0.37, octaves, seed, 0)
@@ -178,6 +200,79 @@ pub fn with_alpha(src: &cairo::ImageSurface, alpha: f64) -> cairo::ImageSurface 
         let cr = cairo::Context::new(&surf).expect("cairo");
         let _ = cr.set_source_surface(src, 0.0, 0.0);
         let _ = cr.paint_with_alpha(alpha);
+    }
+    surf
+}
+
+/// Rizos de agua en movimiento: crestas claras y senos oscuros alargados a lo largo de la
+/// corriente (eje y), con el alfa ya horneado (premultiplicado). Un solo relleno por río.
+pub fn ripple_tile(size: i32, seed: u32, strength: f64) -> cairo::ImageSurface {
+    let mut surf = cairo::ImageSurface::create(cairo::Format::ARgb32, size, size).expect("ripple");
+    let stride = surf.stride() as usize;
+    {
+        let mut data = surf.data().expect("ripple data");
+        for y in 0..size as usize {
+            for x in 0..size as usize {
+                let (fx, fy) = (x as f64 / size as f64, y as f64 / size as f64);
+                // Dos capas de rizos: una ancha y otra fina, ambas estiradas a lo largo de y.
+                let n = fbm_aniso(fx * 14.0, fy * 4.0, 3, seed, 14, 4);
+                let m = fbm_aniso(fx * 28.0 + 3.0, fy * 7.0, 2, seed ^ 0x77, 28, 7);
+                let v = 0.65 * n + 0.35 * m;
+                let ridge = 1.0 - (v - 0.5).abs() * 2.0;
+                let hi = ((ridge - 0.62) / 0.38).clamp(0.0, 1.0).powf(1.8) * strength;
+                let lo = ((0.44 - v) / 0.44).clamp(0.0, 1.0).powf(1.3) * strength * 0.8;
+                let a = (hi + lo).min(1.0);
+                // Crestas blanco azulado, senos azul oscuro.
+                let (r, g, b) = (0.86 * hi + 0.02 * lo, 0.95 * hi + 0.08 * lo, 1.0 * hi + 0.18 * lo);
+                put(&mut data, stride, x, y, [(r.min(a) * 255.0) as u8, (g.min(a) * 255.0) as u8, (b.min(a) * 255.0) as u8, (a * 255.0) as u8]);
+            }
+        }
+    }
+    surf
+}
+
+/// Chorros de una cascada: hilos verticales de espuma blanca con huecos, alfa premultiplicado.
+pub fn streak_tile(size: i32, seed: u32) -> cairo::ImageSurface {
+    let mut surf = cairo::ImageSurface::create(cairo::Format::ARgb32, size, size).expect("streak");
+    let stride = surf.stride() as usize;
+    {
+        let mut data = surf.data().expect("streak data");
+        for y in 0..size as usize {
+            for x in 0..size as usize {
+                let (fx, fy) = (x as f64 / size as f64, y as f64 / size as f64);
+                let n = fbm_aniso(fx * 18.0, fy * 2.0, 3, seed, 18, 2);
+                let m = fbm_aniso(fx * 40.0 + 7.0, fy * 5.0, 2, seed ^ 0x99, 40, 5);
+                let v = 0.6 * n + 0.4 * m;
+                let hi = ((v - 0.48) / 0.52).clamp(0.0, 1.0).powf(1.5);
+                let a = (0.15 + 0.85 * hi).min(1.0);
+                let (r, g, b) = (mix3(0.55, 0.97, hi), mix3(0.72, 0.99, hi), 1.0);
+                put(&mut data, stride, x, y, [(r * a * 255.0) as u8, (g * a * 255.0) as u8, (b * a * 255.0) as u8, (a * 255.0) as u8]);
+            }
+        }
+    }
+    surf
+}
+
+fn mix3(a: f64, b: f64, t: f64) -> f64 {
+    a + (b - a) * t
+}
+
+/// Cirros: velos blancos muy estirados en horizontal, alfa premultiplicado, repetibles.
+pub fn cirrus_tile(size: i32, seed: u32) -> cairo::ImageSurface {
+    let mut surf = cairo::ImageSurface::create(cairo::Format::ARgb32, size, size).expect("cirrus");
+    let stride = surf.stride() as usize;
+    {
+        let mut data = surf.data().expect("cirrus data");
+        for y in 0..size as usize {
+            for x in 0..size as usize {
+                let (fx, fy) = (x as f64 / size as f64, y as f64 / size as f64);
+                let n = fbm_aniso(fx * 3.0, fy * 14.0, 3, seed, 3, 14);
+                let m = fbm_aniso(fx * 6.0 + 2.0, fy * 30.0, 2, seed ^ 0x3c, 6, 30);
+                let v = 0.6 * n + 0.4 * m;
+                let a = ((v - 0.52) / 0.3).clamp(0.0, 1.0).powf(1.6) * 0.5;
+                put(&mut data, stride, x, y, [(a * 255.0) as u8, (a * 255.0) as u8, (a * 255.0) as u8, (a * 255.0) as u8]);
+            }
+        }
     }
     surf
 }

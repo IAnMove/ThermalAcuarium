@@ -360,13 +360,51 @@ impl Weather {
                 let (sx, sy) = (w * 0.72, hz * (0.22 + 0.45 * heat));
                 let sr = (28.0 + 60.0 * heat) * sc;
                 let sun = mix(mix((1.0, 0.97, 0.85), (1.0, 0.55, 0.15), hot), (0.9, 0.2, 0.05), crit);
+                // Cirros: velos finos estirados en horizontal, más densos con calor.
+                let cirrus = noise::cirrus_tile(256, 42);
+                let cp = cairo::SurfacePattern::create(&cirrus);
+                cp.set_extend(cairo::Extend::Repeat);
+                let mut m = cairo::Matrix::identity();
+                m.scale(1.0 / (2.2 * sc), 1.0 / (0.9 * sc));
+                cp.set_matrix(m);
+                c.save_q();
+                c.rectangle(0.0, 0.0, w, hz * 0.75);
+                c.clip();
+                let _ = c.set_source(&cp);
+                let _ = c.paint_with_alpha(0.35 + 0.3 * heat);
+                c.restore_q();
+                // Corona: rayos suaves que giran con la temperatura, y halo amplio.
                 let g = RadialGradient::new(sx, sy, sr * 0.6, sx, sy, sr * (3.0 + 2.0 * hot));
                 g.add_color_stop_rgba(0.0, sun.0, sun.1, sun.2, 0.55 + 0.3 * hot);
                 g.add_color_stop_rgba(1.0, sun.0, sun.1, sun.2, 0.0);
                 let _ = c.set_source(&g);
                 c.paint_q();
-                rgba(c, sun, 1.0);
-                c.arc(sx, sy, sr, 0.0, 2.0 * PI);
+                let nr = 14;
+                for k in 0..nr {
+                    let a0 = k as f64 / nr as f64 * 2.0 * PI + heat * 0.7;
+                    let spread = 0.05 + 0.04 * noise::rnd(k, 1, 9);
+                    let len = sr * (2.2 + 1.6 * noise::rnd(k, 2, 9) + 1.5 * hot);
+                    let g = RadialGradient::new(sx, sy, sr * 0.9, sx, sy, len);
+                    g.add_color_stop_rgba(0.0, sun.0, sun.1, sun.2, 0.15 + 0.12 * hot);
+                    g.add_color_stop_rgba(1.0, sun.0, sun.1, sun.2, 0.0);
+                    let _ = c.set_source(&g);
+                    c.move_to(sx, sy);
+                    c.arc(sx, sy, len, a0 - spread, a0 + spread);
+                    c.close_path();
+                    c.fill_q();
+                }
+                // Disco con el borde suave (limbo) y el centro más claro.
+                let g = RadialGradient::new(sx - sr * 0.25, sy - sr * 0.25, 0.0, sx, sy, sr * 1.06);
+                g.add_color_stop_rgba(0.0, lighten(sun, 0.35).0, lighten(sun, 0.35).1, lighten(sun, 0.35).2, 1.0);
+                g.add_color_stop_rgba(0.75, sun.0, sun.1, sun.2, 1.0);
+                g.add_color_stop_rgba(0.94, sun.0, sun.1, sun.2, 0.9);
+                g.add_color_stop_rgba(1.0, sun.0, sun.1, sun.2, 0.0);
+                let _ = c.set_source(&g);
+                c.arc(sx, sy, sr * 1.06, 0.0, 2.0 * PI);
+                c.fill_q();
+                // Banda luminosa del horizonte.
+                let _ = c.set_source(lin(0.0, hz * 0.7, 0.0, hz, &[(0.0, hzc, 0.0), (1.0, lighten(hzc, 0.25), 0.55)]));
+                c.rectangle(0.0, hz * 0.7, w, hz * 0.3 + 1.0);
                 c.fill_q();
             }
             *self.sky.borrow_mut() = Some(s);

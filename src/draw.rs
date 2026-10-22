@@ -44,6 +44,10 @@ impl Laps {
         Laps { on: std::env::var_os("TA_PROF").is_some(), scope, t: std::time::Instant::now() }
     }
 
+    pub fn on(&self) -> bool {
+        self.on
+    }
+
     pub fn lap(&mut self, name: &'static str) {
         if !self.on {
             return;
@@ -331,6 +335,31 @@ pub fn floor(cr: &Context, v: &View, dynamic: bool) {
     cr.fill_keep();
     cr.save_q();
     cr.clip();
+    // Rizaduras de la arena (estilizado): crestas claras y surcos en sombra que siguen el fondo.
+    if v.style == Style::Cartoon {
+        let n = 9;
+        for i in 0..n {
+            let u = (i as f64 + 0.5) / n as f64;
+            let amp = 1.2 + 2.0 * u;
+            for (dy, c, a, wd) in [(0.0, lighten(top_c, 0.45), 0.22 + 0.2 * u, 1.2 + u), (1.6 + u, darken(bot_c, 0.35), 0.18 + 0.2 * u, 1.4 + 1.2 * u)] {
+                rgba(cr, c, a);
+                cr.set_line_width(wd);
+                let mut x = -4.0;
+                let mut first = true;
+                while x < w + 8.0 {
+                    let y = t.floor_y(x) + (h - t.floor_y(x)) * (0.12 + 0.8 * u) + dy + amp * ((x * (0.035 + 0.01 * u) + i as f64 * 1.9).sin() + 0.4 * (x * 0.09 + i as f64).sin());
+                    if first {
+                        cr.move_to(x, y);
+                        first = false;
+                    } else {
+                        cr.line_to(x, y);
+                    }
+                    x += 6.0;
+                }
+                cr.stroke_q();
+            }
+        }
+    }
     // Granos de arena.
     for i in 0..140u64 {
         let px = unit(i * 2 + 1) * w;

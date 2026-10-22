@@ -850,8 +850,10 @@ fn snapshot(path: &str) {
     surf.write_to_png(&mut file).expect("no se pudo escribir el PNG");
 }
 
-/// `--bench-scene volcano|rivers|weather`: dibuja 40 fotogramas de esa pestaña a 1180×680 sin ventana
-/// y dice cuánto cuesta cada uno (para optimizar sin adivinar).
+/// `--bench-scene volcano|rivers|weather [--mem 0.97] [--tribs-demo] [--out ruta.png [--warm SEG]]`: dibuja 120
+/// fotogramas de esa pestaña a 1180×680 sin ventana y dice cuánto cuesta cada uno (para optimizar
+/// sin adivinar). Con `--out` guarda además el último fotograma, tras `--warm` segundos más de
+/// simulación, para revisar el aspecto; `--mem` es la fracción de RAM en uso del volcán.
 fn bench_scene(which: &str) {
     let pal = Palette::load();
     let font = current_font();
@@ -870,7 +872,8 @@ fn bench_scene(which: &str) {
         "volcano" => {
             let mut v = volcano::Volcano::new();
             v.resize(w as f64, h as f64);
-            v.set_memory(s.ram_total * 0.8, s.ram_total, s.cached, s.swap_used, s.swap_total);
+            let frac: f64 = arg_val("--mem").and_then(|s| s.parse().ok()).unwrap_or(0.8);
+            v.set_memory(s.ram_total * frac, s.ram_total, s.cached, s.swap_used, s.swap_total);
             v.set_groups(&groups);
             Box::new(move |cr, dt| {
                 v.step(dt);
@@ -882,7 +885,27 @@ fn bench_scene(which: &str) {
             v.resize(w as f64, h as f64);
             v.set_disks(&disks);
             v.set_groups(&groups);
+            // `--tribs-demo`: seis afluentes sintéticos; a los 3 s dos se secan y a los 6 s uno
+            // vuelve, para ver los huecos fijos y la transición suave.
+            let demo = has_flag("--tribs-demo");
+            let (mut clock, mut next) = (0.0f64, 1.0f64);
             Box::new(move |cr, dt| {
+                clock += dt;
+                if demo && clock >= next {
+                    next += 1.0;
+                    let names = ["brave", "codex", "claude", "pacman", "rsync", "ffmpeg"];
+                    let g: Vec<sys::Group> = names
+                        .iter()
+                        .enumerate()
+                        .filter(|(i, _)| !(clock >= 3.0 && clock < 6.0 && (*i == 1 || *i == 4)) && !(clock >= 6.0 && *i == 4))
+                        .map(|(i, n)| {
+                            let bps = 3e4 * 12f64.powi(i as i32 % 4) * (1.0 + 0.3 * (clock + i as f64).sin());
+                            let (w, r) = if i % 2 == 0 { (bps, 0.0) } else { (0.0, bps) };
+                            sys::Group { key: n.to_string(), procs: vec![sys::Proc { pid: 100 + i as i32, start: 0, cpu: 0.0, mem: 0.0, wbps: w, rbps: r, swap: 0.0 }], protected: false }
+                        })
+                        .collect();
+                    v.set_groups(&g);
+                }
                 v.step(dt);
                 v.draw(cr, &pal, &font);
             })
@@ -903,6 +926,16 @@ fn bench_scene(which: &str) {
         draw(&cr, 1.0 / 30.0);
     }
     eprintln!("{which}: {:.1} ms/fotograma", t0.elapsed().as_secs_f64() * 1000.0 / 120.0);
+    // `--out ruta.png`: guarda el último fotograma (tras `--warm N` segundos más de simulación).
+    if let Some(out) = arg_val("--out") {
+        let warm: f64 = arg_val("--warm").and_then(|s| s.parse().ok()).unwrap_or(0.0);
+        for _ in 0..(warm * 30.0) as usize {
+            draw(&cr, 1.0 / 30.0);
+        }
+        drop(cr);
+        let mut file = std::fs::File::create(&out).expect("no se pudo crear el PNG");
+        surf.write_to_png(&mut file).expect("no se pudo escribir el PNG");
+    }
 }
 
 /// `--bench-gpu [--style S] [--names N] [--temp T]`: mide el coste en CPU de construir el árbol de
